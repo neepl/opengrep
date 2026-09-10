@@ -1,0 +1,10 @@
+rules:
+  - id: smali-cf-loop
+    languages: [smali]
+    severity: WARNING
+    message: taint reaches a sink through branching control flow
+    mode: taint
+    pattern-sources:
+      - pattern: invoke-virtual {$I}, Landroid/content/Intent;->getStringExtra(Ljava/lang/String;)Ljava/lang/String;
+    pattern-sinks:
+      - pattern: invoke-virtual {$D, $SQL}, Landroid/database/sqlite/SQLiteDatabase;->execSQL(Ljava/lang/String;)V

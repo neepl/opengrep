@@ -1,0 +1,10 @@
+rules:
+  - id: smali-basic-flow
+    languages: [smali]
+    severity: WARNING
+    message: attacker-controlled value reaches a sink
+    mode: taint
+    pattern-sources:
+      - pattern: invoke-virtual {$I}, Landroid/content/Intent;->getStringExtra(Ljava/lang/String;)Ljava/lang/String;
+    pattern-sinks:
+      - pattern: invoke-virtual {$D, $SQL}, Landroid/database/sqlite/SQLiteDatabase;->execSQL(Ljava/lang/String;)V

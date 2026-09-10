@@ -541,10 +541,21 @@ let vb = {
   skip_nested_in_extract_calls = false;
 }
 
+(* ========================================================================== *)
+(* Lookup Function *)
+(* ========================================================================== *)
+
+(* Smali reuses the Java models. They are keyed by method name, and method
+   names are byte-identical in bytecode: StringBuilder.append/toString, the
+   collection accessors, and `<init>` -- which is literally the Dalvik
+   constructor name -- all carry over unchanged. *)
+let smali = java
+
 let get (lang : Lang.t) : t =
   match lang with
   | Lang.Python | Lang.Python2 | Lang.Python3 -> python
   | Lang.Ruby -> ruby
+  | Lang.Smali -> smali
   | Lang.Crystal -> crystal
   | Lang.Js -> javascript
   | Lang.Ts -> typescript

@@ -412,12 +412,15 @@ let statement (env : env) (x : CST.statement) : G.stmt option =
   | `Ellips t -> Some (G.ExprStmt (G.Ellipsis (token env t) |> G.e, sc (token env t)) |> G.s)
   | `Choice_label s -> (
       match s with
+      (* Both forms must be normalised the same way as a jump target, or
+         the label a `goto` names never matches the label that defines it
+         and CFG_build silently produces no edge. *)
       | `Label lb ->
           let s, t = str env lb in
-          Some (G.Label ((s, t), G.Block (fb []) |> G.s) |> G.s)
+          Some (G.Label ((normalize_label s, t), G.Block (fb []) |> G.s) |> G.s)
       | `Jmp_label lb ->
           let s, t = str env lb in
-          Some (G.Label ((s, t), G.Block (fb []) |> G.s) |> G.s)
+          Some (G.Label ((normalize_label s, t), G.Block (fb []) |> G.s) |> G.s)
       | `Dire d -> directive env d
       | `Anno_dire (t, _, _, _, _) ->
           Some (G.OtherStmt (G.OS_Todo, [ G.Tk (token env t) ]) |> G.s)

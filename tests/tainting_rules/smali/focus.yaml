@@ -1,0 +1,12 @@
+rules:
+  - id: smali-focus
+    languages: [smali]
+    severity: WARNING
+    message: tainted value reaches the selection argument specifically
+    mode: taint
+    pattern-sources:
+      - pattern: invoke-virtual {$I}, Landroid/content/Intent;->getStringExtra(Ljava/lang/String;)Ljava/lang/String;
+    pattern-sinks:
+      - patterns:
+          - pattern: invoke-virtual {$D, $TABLE, $SEL}, Landroid/database/sqlite/SQLiteDatabase;->query(Ljava/lang/String;Ljava/lang/String;)V
+          - focus-metavariable: $SEL

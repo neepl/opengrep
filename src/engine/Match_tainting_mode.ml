@@ -959,6 +959,7 @@ let check_rules ~match_hook
          | Lang.Ruby
          | Lang.Rust
          | Lang.Scala
+         | Lang.Smali
          | Lang.Swift
          | Lang.Ts
          | Lang.Vb ->
