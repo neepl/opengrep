@@ -565,6 +565,15 @@ not ambiguous is welcome here.
     ),
     Language(
         comment="",
+        id_="smali",
+        name="Smali",
+        keys=["smali"],
+        exts=[".smali"],
+        maturity=Maturity.ALPHA,
+        shebangs=[]
+    ),
+    Language(
+        comment="",
         id_="solidity",
         name="Solidity",
         keys=["solidity", "sol"],

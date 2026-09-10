@@ -40,6 +40,7 @@ type t =
 | Rust
 | Scala
 | Scheme
+| Smali
 | Solidity
 | Swift
 | Terraform
