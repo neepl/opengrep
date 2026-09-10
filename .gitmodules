@@ -155,5 +155,5 @@ url = https://github.com/opengrep/semgrep-apex.git
 	branch = main
 [submodule "OSS/languages/smali/tree-sitter/opengrep-smali"]
 	path = languages/smali/tree-sitter/opengrep-smali
-	url = https://github.com/opengrep/opengrep-smali
+	url = git@github.com:neepl/opengrep-smali.git
 	branch = main
