@@ -16,7 +16,21 @@ module CST = Tree_sitter_smali.CST
 module H = Parse_tree_sitter_helpers
 module G = AST_generic
 
-type env = unit H.env
+(* Per-method context.
+   - [switch_targets] maps a payload label (`:pswitch_data_0`) to the case
+     targets declared under it, so a `packed-switch`/`sparse-switch`
+     instruction can be lowered to a real Switch even though its payload is
+     a separate directive further down the method.
+   - [param_map] maps parameter registers onto their local numbering, so
+     `p0` and the `v` register it aliases are one variable (task 4.3). *)
+type ctx = {
+  switch_targets : (string, (string * Tok.t) list) Hashtbl.t;
+  mutable param_map : (string * string) list;
+}
+
+type env = ctx H.env
+
+let new_ctx () = { switch_targets = Hashtbl.create 8; param_map = [] }
 
 let token = H.token
 let str = H.str
@@ -65,7 +79,12 @@ let ty_of (s, t) : G.type_ = G.TyN (name_of (s, t)) |> G.t
 let register (env : env) (x : CST.register) : G.expr =
   match x with
   | `Choice_var (`Var v) -> id_expr (str env v)
-  | `Choice_var (`Param p) -> id_expr (str env p)
+  | `Choice_var (`Param p) ->
+      (* A parameter register aliases a numbered local; use the local name so
+         `p0` and `v3` in the same method are one variable. *)
+      let s, t = str env p in
+      let s = try List.assoc s env.H.extra.param_map with Not_found -> s in
+      id_expr (s, t)
   | `Semg_meta m -> id_expr (str env m)
 
 let literal (env : env) (x : CST.literal) : G.expr =
@@ -272,6 +291,52 @@ let expression (env : env) ((op, args, _nl) : CST.expression) : G.expr =
   | _ -> G.OtherExpr ((opstr, optok), List_.map (fun e -> G.E e) vals) |> G.e
 
 (*****************************************************************************)
+(* Control flow *)
+(*****************************************************************************)
+
+(* Labels and jump targets are the same thing to us; the grammar spells a
+   definition `:foo` and a reference `foo:` differently, and both carry the
+   punctuation in their token text. Strip it so a `goto :foo` resolves to
+   the `:foo` that defines it -- CFG_build matches labels by name. *)
+let normalize_label (s : string) : string =
+  let s = if String.length s > 0 && s.[0] = ':' then String.sub s 1 (String.length s - 1) else s in
+  let n = String.length s in
+  if n > 0 && s.[n - 1] = ':' then String.sub s 0 (n - 1) else s
+
+let label_of_value (env : env) (v : CST.value) : (string * Tok.t) option =
+  match v with
+  | `Choice_type (`Label l) ->
+      let s, t = str env l in
+      Some (normalize_label s, t)
+  | `Choice_type (`Jmp_label l) ->
+      let s, t = str env l in
+      Some (normalize_label s, t)
+  | _ -> None
+
+let is_goto op = op = "goto" || op = "goto/16" || op = "goto/32"
+let is_if op = String.length op >= 3 && String.sub op 0 3 = "if-"
+let is_return op = String.length op >= 6 && String.sub op 0 6 = "return"
+let is_throw op = op = "throw"
+let is_switch op = op = "packed-switch" || op = "sparse-switch"
+
+(* `if-eqz vA, :L` is "if vA == 0 goto L"; `if-ge vA, vB, :L` is
+   "if vA >= vB goto L". The comparison operator is recovered from the
+   mnemonic so the condition is a real expression rather than opaque. *)
+let cmp_operator (op : string) : G.operator option =
+  let base = match String.index_opt op '/' with
+    | Some i -> String.sub op 0 i
+    | None -> op
+  in
+  match base with
+  | "if-eq" | "if-eqz" -> Some G.Eq
+  | "if-ne" | "if-nez" -> Some G.NotEq
+  | "if-lt" | "if-ltz" -> Some G.Lt
+  | "if-ge" | "if-gez" -> Some G.GtE
+  | "if-gt" | "if-gtz" -> Some G.Gt
+  | "if-le" | "if-lez" -> Some G.LtE
+  | _ -> None
+
+(*****************************************************************************)
 (* Statements *)
 (*****************************************************************************)
 
@@ -306,9 +371,78 @@ let statement (env : env) (x : CST.statement) : G.stmt option =
       | `Dire d -> directive env d
       | `Anno_dire (t, _, _, _, _) ->
           Some (G.OtherStmt (G.OS_Todo, [ G.Tk (token env t) ]) |> G.s)
-      | `Exp e ->
-          let ex = expression env e in
-          Some (G.ExprStmt (ex, sc (G.fake ";")) |> G.s))
+      | `Exp ((op, args, _nl) as e) -> (
+          let opstr, optok = str env op in
+          let cst_vals =
+            match args with
+            | None -> []
+            | Some (v0, rest) -> v0 :: List_.map (fun (_c, v) -> v) rest
+          in
+          let labels = List_.filter_map (label_of_value env) cst_vals in
+          let regs =
+            List_.filter_map
+              (fun v ->
+                match v with
+                | `Choice_type (`Regi r) -> Some (register env r)
+                | _ -> None)
+              cst_vals
+          in
+          match opstr with
+          (* unconditional jump *)
+          | _ when is_goto opstr -> (
+              match labels with
+              | (l, lt) :: _ -> Some (G.Goto (optok, (l, lt), sc (G.fake ";")) |> G.s)
+              | [] -> Some (G.ExprStmt (expression env e, sc (G.fake ";")) |> G.s))
+          (* conditional jump: lower to a real If so both edges exist *)
+          | _ when is_if opstr -> (
+              match (labels, cmp_operator opstr) with
+              | (l, lt) :: _, Some opr ->
+                  let zero = G.L (G.Int (Parsed_int.of_int 0)) |> G.e in
+                  let lhs, rhs =
+                    match regs with
+                    | [ a; b ] -> (a, b)
+                    | [ a ] -> (a, zero)
+                    | _ -> (zero, zero)
+                  in
+                  let cond =
+                    G.Call
+                      ( G.IdSpecial (G.Op opr, optok) |> G.e,
+                        fb [ G.Arg lhs; G.Arg rhs ] )
+                    |> G.e
+                  in
+                  Some
+                    (G.If
+                       ( optok,
+                         G.Cond cond,
+                         G.Goto (optok, (l, lt), sc (G.fake ";")) |> G.s,
+                         None )
+                    |> G.s)
+              | _ -> Some (G.ExprStmt (expression env e, sc (G.fake ";")) |> G.s))
+          | _ when is_switch opstr -> (
+              let scrutinee = match regs with r :: _ -> r | [] -> G.L (G.Null optok) |> G.e in
+              match labels with
+              | (payload, _) :: _ -> (
+                  match Hashtbl.find_opt env.H.extra.switch_targets payload with
+                  | Some targets when targets <> [] ->
+                      let cases =
+                        List_.map
+                          (fun (t, tt) ->
+                            G.CasesAndBody
+                              ( [ G.Case (optok, G.PatWildcard tt) ],
+                                G.Goto (tt, (t, tt), sc (G.fake ";")) |> G.s ))
+                          targets
+                      in
+                      Some (G.Switch (optok, Some (G.Cond scrutinee), cases) |> G.s)
+                  | _ ->
+                      Some (G.ExprStmt (expression env e, sc (G.fake ";")) |> G.s))
+              | [] -> Some (G.ExprStmt (expression env e, sc (G.fake ";")) |> G.s))
+          | _ when is_return opstr ->
+              let e_opt = match regs with r :: _ -> Some r | [] -> None in
+              Some (G.Return (optok, e_opt, sc (G.fake ";")) |> G.s)
+          | _ when is_throw opstr ->
+              let ex = match regs with r :: _ -> r | [] -> G.L (G.Null optok) |> G.e in
+              Some (G.Throw (optok, ex, sc (G.fake ";")) |> G.s)
+          | _ -> Some (G.ExprStmt (expression env e, sc (G.fake ";")) |> G.s)))
 
 (* Fuse `invoke-* ... / move-result* vX` into a single assignment, so that a
  * pattern can bind the result register. Debug directives between the two
@@ -362,6 +496,65 @@ let method_attrs (env : env) (x : CST.method_access_modifiers option) :
           | `Cons t -> G.unhandled_keywordattr (str env t))
         xs
 
+(* Pre-pass over a method body:
+   - record each switch payload under the label that precedes it, so the
+     switch instruction can find its targets;
+   - work out the parameter-register aliasing from `.registers`/`.locals`
+     and the descriptor arity. With `.registers N`, the arguments occupy the
+     last N_args registers; with `.locals L` they start at vL. *)
+let scan_method_body (env : env) (stmts : CST.statement list) (nargs : int) : unit =
+  let ctx = env.H.extra in
+  Hashtbl.reset ctx.switch_targets;
+  ctx.param_map <- [];
+  let pending_label = ref None in
+  let total = ref None and locals = ref None in
+  List.iter
+    (fun st ->
+      match st with
+      | `Choice_label (`Label l) | `Choice_label (`Jmp_label l) ->
+          pending_label := Some (normalize_label (fst (str env l)))
+      | `Choice_label (`Dire (`Regiss_dire (_, n))) ->
+          total := int_of_string_opt (fst (str env n))
+      | `Choice_label (`Dire (`Locals_dire (_, n))) ->
+          locals := int_of_string_opt (fst (str env n))
+      | `Choice_label (`Dire (`Packed_switch_dire (_, _, targets, _))) ->
+          (match !pending_label with
+          | Some l ->
+              Hashtbl.replace ctx.switch_targets l
+                (List_.map
+                   (fun t ->
+                     match t with
+                     | `Label x | `Jmp_label x ->
+                         let s, tk = str env x in
+                         (normalize_label s, tk))
+                   targets)
+          | None -> ());
+          pending_label := None
+      | `Choice_label (`Dire (`Sparse_switch_dire (_, entries, _))) ->
+          (match !pending_label with
+          | Some l ->
+              Hashtbl.replace ctx.switch_targets l
+                (List_.map
+                   (fun (_n, _arrow, x) ->
+                     let s, tk = str env x in
+                     (normalize_label s, tk))
+                   entries)
+          | None -> ());
+          pending_label := None
+      | _ -> pending_label := None)
+    stmts;
+  let base =
+    match (!total, !locals) with
+    | Some t, _ -> Some (t - nargs)
+    | None, Some l -> Some l
+    | None, None -> None
+  in
+  match base with
+  | Some b when b >= 0 ->
+      ctx.param_map <-
+        List.init nargs (fun i -> (Printf.sprintf "p%d" i, Printf.sprintf "v%d" (b + i)))
+  | _ -> ()
+
 let method_definition (env : env) ((_m, mods, msig, stmts, _end) : CST.method_definition)
     : G.field =
   let name = method_signature env msig in
@@ -378,6 +571,14 @@ let method_definition (env : env) ((_m, mods, msig, stmts, _end) : CST.method_de
     | `LPAR_ellips_RPAR_type (_lp, ell, _rp, rett) ->
         ([ G.ParamEllipsis (token env ell) ], rett)
   in
+  let is_static =
+    match mods with
+    | None -> false
+    | Some xs ->
+        List.exists (fun m -> match m with `Access_modi (`Static _) -> true | _ -> false) xs
+  in
+  let nargs = List.length fparams + if is_static then 0 else 1 in
+  scan_method_body env stmts nargs;
   let body =
     stmts
     |> List_.filter_map (fun s ->
@@ -480,7 +681,7 @@ let parse file =
   H.wrap_parser
     (fun () -> Tree_sitter_smali.Parse.file !!file)
     (fun cst _extras ->
-      let env = { H.file; conv = H.line_col_to_pos file; extra = () } in
+      let env = { H.file; conv = H.line_col_to_pos file; extra = new_ctx () } in
       match class_definition env cst with
       | Either.Left prog -> prog
       | Either.Right stmts -> stmts)
@@ -499,7 +700,7 @@ let parse_pattern str_ =
     (fun () -> parse_statements_or_class str_)
     (fun cst _extras ->
       let file = Fpath.v "<pattern>" in
-      let env = { H.file; conv = H.line_col_to_pos_pattern str_; extra = () } in
+      let env = { H.file; conv = H.line_col_to_pos_pattern str_; extra = new_ctx () } in
       match class_definition env cst with
       | Either.Left prog -> G.Pr prog
       | Either.Right [ st ] -> G.S st
