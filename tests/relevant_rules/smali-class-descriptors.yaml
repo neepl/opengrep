@@ -1,0 +1,18 @@
+# A class is written as a type descriptor in smali (Ljavax/crypto/Cipher;) but
+# the AST normalises it to a dotted name (javax.crypto.Cipher). The prefilter
+# searches the raw target text, so without the descriptor spelling as an
+# alternative it discards every target and these rules never run.
+rules:
+  - id: smali-prefilter-static-call
+    languages: [smali]
+    severity: WARNING
+    message: static call through a class descriptor
+    pattern: |
+      invoke-static {...}, Ljavax/crypto/Cipher;->getInstance(Ljava/lang/String;)Ljavax/crypto/Cipher;
+
+  - id: smali-prefilter-static-field
+    languages: [smali]
+    severity: WARNING
+    message: static field read through a class descriptor
+    pattern: |
+      sget-object $R, Landroid/os/Build$VERSION;->SDK_INT:I
