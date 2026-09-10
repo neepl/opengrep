@@ -807,6 +807,12 @@ let assign_implicitly_declares lang =
   || lang =*= Lang.Python
   || lang =*= Lang.Ruby
   || lang =*= Lang.Crystal
+  (* smali has no declarations at all: a register comes into existence by
+     being assigned. Without this its registers stay unresolved, and
+     dataflow constant propagation then skips them -- so a pattern written
+     with a literal in operand position never matches a target that loads
+     the value into a register first. *)
+  || lang =*= Lang.Smali
   || Lang.is_js lang
 
 (*****************************************************************************)

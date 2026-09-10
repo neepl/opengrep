@@ -1,0 +1,4 @@
+# Smali is produced by disassembling an APK, so there is no upstream
+# repository of hand-written smali to measure against in the way the other
+# languages use this file. Parse-rate is measured instead against the
+# disassembled corpus in tests/ (see task 6.4).

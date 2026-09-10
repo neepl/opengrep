@@ -17,6 +17,7 @@ let t = Testo.create
 let name_tests : (string * Lang.t * Fpath.t * success) list =
   [
     (* name, language, file name, expected result *)
+    ("smali", Smali, "foo.smali", OK);
     ("js", Js, "foo.js", OK);
     ("js relative path", Js, "./a/b.c/foo.js", OK);
     ("js absolute path", Js, "/a/b.c/foo.js", OK);
