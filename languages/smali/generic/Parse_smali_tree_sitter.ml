@@ -1,21 +1,476 @@
 (* Translate the smali CST produced by tree-sitter into AST_generic.
  *
- * STATUS: the tree-sitter parse is real -- syntax errors in a target are
- * reported as such -- but the CST is not yet lowered. Both entry points
- * currently yield an empty program / pattern, so a `.smali` target is
- * selected, read and parsed end to end without any construct being
- * matchable yet.
+ * Smali is register-based three-address code, which is close to the engine's
+ * own IL. The job here is to lower it into the AST_generic shapes the
+ * existing analyses already understand -- assignments, calls, literals and
+ * real control flow -- so that constant propagation, CFG construction and
+ * taint work without any engine change.
  *
- * The lowering itself is Gate C of the add-smali-language-support change
- * (tasks 4.1-4.15): registers as method-scoped locals, invoke/move-result
- * fusion into assignments, const-* as literals, and labels/gotos/switches/
- * try-catch onto the constructs CFG_build already understands. Until that
- * lands, smali rules cannot match anything, which is why smali is marked
- * `develop` maturity in the language table.
+ * Naming: class and type references are normalised from their descriptor
+ * form to a dotted name (`Lcom/foo/Bar;` -> `com.foo.Bar`). Patterns go
+ * through this same function, so `L$CLS;` normalises to `$CLS`, which is
+ * what makes a metavariable in class position work.
  *)
 open Fpath_.Operators
-module G = AST_generic
+module CST = Tree_sitter_smali.CST
 module H = Parse_tree_sitter_helpers
+module G = AST_generic
+
+type env = unit H.env
+
+let token = H.token
+let str = H.str
+let fb = Tok.unsafe_fake_bracket
+let sc tok = tok
+
+(*****************************************************************************)
+(* Names *)
+(*****************************************************************************)
+
+(* `Lcom/foo/Bar;` is emitted by the grammar as the token `L`, a
+ * `/`-separated list of segments, and `;`. Join the segments with '.' so a
+ * reference reads as a normal qualified name. A metavariable written as
+ * `L$CLS;` is a single segment and comes out as `$CLS`, which the matcher
+ * then treats as a metavariable. *)
+let class_identifier (env : env) ((_l, first, rest, _semi) : CST.class_identifier)
+    : string * Tok.t =
+  let s0, t0 = str env first in
+  let parts = s0 :: List_.map (fun (_slash, seg) -> fst (str env seg)) rest in
+  (String.concat "." parts, t0)
+
+let rec type_ (env : env) (x : CST.type_) : string * Tok.t =
+  match x with
+  | `Prim_type p -> (
+      (* V Z B S C I J F D -- kept as their descriptor letter, since the
+       * pattern side is written in the same notation *)
+      match p with
+      | `Tok_choice_v t -> str env t
+      | `Tok_prec_p1_choice_v t -> str env t)
+  | `Class_id c -> class_identifier env c
+  | `Array_type (lb, t) ->
+      let s, _ = type_ env t in
+      (s ^ "[]", token env lb)
+
+let name_of (s, t) : G.name = G.Id ((s, t), G.empty_id_info ())
+let id_expr (s, t) : G.expr = G.N (name_of (s, t)) |> G.e
+let ty_of (s, t) : G.type_ = G.TyN (name_of (s, t)) |> G.t
+
+(*****************************************************************************)
+(* Operands *)
+(*****************************************************************************)
+
+(* Registers are ordinary method-local variables. `v0` and `p0` are distinct
+ * names; normalising p-registers onto their v-numbering needs the method's
+ * `.registers` count and its argument count, which is task 4.3. *)
+let register (env : env) (x : CST.register) : G.expr =
+  match x with
+  | `Choice_var (`Var v) -> id_expr (str env v)
+  | `Choice_var (`Param p) -> id_expr (str env p)
+  | `Semg_meta m -> id_expr (str env m)
+
+let literal (env : env) (x : CST.literal) : G.expr =
+  match x with
+  | `Num n ->
+      let s, t = str env n in
+      G.L (G.Int (Parsed_int.parse (s, t))) |> G.e
+  | `Float f ->
+      let s, t = str env f in
+      G.L (G.Float (float_of_string_opt s, t)) |> G.e
+  | `Nan n -> G.L (G.Float (None, snd (str env n))) |> G.e
+  | `Infi i -> G.L (G.Float (None, snd (str env i))) |> G.e
+  | `Str (l, frags, r) ->
+      let parts =
+        List_.map
+          (fun f ->
+            match f with
+            | `Str_frag x -> fst (str env x)
+            | `Esc_seq (`Imm_tok_bslash_pat_36cdeeb x) -> fst (str env x)
+            | `Esc_seq (`Esc_seq_ x) -> fst (str env x))
+          frags
+      in
+      let s = String.concat "" parts in
+      G.L (G.String (token env l, (s, token env l), token env r)) |> G.e
+  | `Bool b -> (
+      match b with
+      | `True t -> G.L (G.Bool (true, token env t)) |> G.e
+      | `False t -> G.L (G.Bool (false, token env t)) |> G.e)
+  | `Char (l, _, _r) -> G.L (G.Char (("", token env l))) |> G.e
+  | `Null t -> G.L (G.Null (token env t)) |> G.e
+
+(* A method reference `Lcom/Foo;->bar(I)V`. The parameter descriptor is not
+ * currently part of the lowered callee, so a pattern naming one overload
+ * matches every overload of that name on that class. See the note in the
+ * change's task 4.6. *)
+let method_signature (env : env) ((nm, _body) : CST.method_signature) :
+    string * Tok.t =
+  match nm with
+  | `Opt_DASH_id (_dash, id) -> str env id
+  | `Num n -> str env n
+
+let full_method_signature (env : env) ((cls, arrow, msig) : CST.full_method_signature)
+    : G.expr =
+  let cls_name =
+    match cls with
+    | `Class_id c -> class_identifier env c
+    | `Array_type (lb, t) ->
+        let s, _ = type_ env t in
+        (s ^ "[]", token env lb)
+  in
+  let m = method_signature env msig in
+  G.DotAccess (id_expr cls_name, token env arrow, G.FN (name_of m)) |> G.e
+
+(* A field reference `Lcom/Foo;->NAME:Ljava/lang/String;`. *)
+let full_field_body (env : env) ((cls, arrow, fb_) : CST.full_field_body) : G.expr =
+  let cls_name =
+    match cls with
+    | `Class_id c -> class_identifier env c
+    | `Array_type (lb, t) ->
+        let s, _ = type_ env t in
+        (s ^ "[]", token env lb)
+  in
+  let fname, _colon, _fty = fb_ in
+  let fid = match fname with `Id x -> str env x | `Num x -> str env x in
+  G.DotAccess (id_expr cls_name, token env arrow, G.FN (name_of fid)) |> G.e
+
+let body (env : env) (x : CST.body) : G.expr =
+  match x with
+  | `Full_meth_sign f -> full_method_signature env f
+  | `Full_field_body f -> full_field_body env f
+  (* a bare field or method reference, i.e. one without its declaring
+     class, as produced by an implicit reference *)
+  | `Field_body (fname, _colon, _fty) ->
+      let fid = match fname with `Id x -> str env x | `Num x -> str env x in
+      id_expr fid
+  | `Meth_sign m -> id_expr (method_signature env m)
+  | `Meth_sign_body b ->
+      let lp = match b with
+        | `LPAR_rep_type_RPAR_type (lp, _, _, _) -> lp
+        | `LPAR_ellips_RPAR_type (lp, _, _, _) -> lp
+      in
+      G.Ellipsis (token env lp) |> G.e
+
+let rec value (env : env) (x : CST.value) : G.expr =
+  match x with
+  | `Ellips t -> G.Ellipsis (token env t) |> G.e
+  | `Deep_ellips (l, v, r) ->
+      G.DeepEllipsis (token env l, value env v, token env r) |> G.e
+  | `Choice_type v -> (
+      match v with
+      | `Type t -> id_expr (type_ env t)
+      | `List (l, vs, r) ->
+          let xs =
+            match vs with
+            | None -> []
+            | Some (v0, rest) ->
+                value env v0 :: List_.map (fun (_c, v) -> value env v) rest
+          in
+          G.Container (G.Tuple, (token env l, xs, token env r)) |> G.e
+      | `Label lb -> id_expr (str env lb)
+      | `Jmp_label lb -> id_expr (str env lb)
+      | `Range (l, r_, r) ->
+          let xs =
+            match r_ with
+            | `Regi_DOTDOT_regi (a, _dd, b) -> [ register env a; register env b ]
+            | `Num_DOTDOT_num (a, _dd, b) ->
+                [ id_expr (str env a); id_expr (str env b) ]
+            | `Jmp_label_DOTDOT_jmp_label (a, _dd, b) ->
+                [ id_expr (str env a); id_expr (str env b) ]
+          in
+          G.Container (G.Tuple, (token env l, xs, token env r)) |> G.e
+      | `Regi r -> register env r
+      | `Body b -> body env b
+      | `Lit l -> literal env l
+      | `Enum_ref (_e, f) -> (
+          match f with
+          | `Full_field_body fb_ -> full_field_body env fb_
+          | `Field_body (fname, _c, _t) ->
+              let fid = match fname with `Id x -> str env x | `Num x -> str env x in
+              id_expr fid)
+      | `Suba_dire (t, _, _, _) -> G.Ellipsis (token env t) |> G.e
+      | `Meth_handle (_op, _at, b) -> (
+          match b with
+          | `Full_field_body fb_ -> full_field_body env fb_
+          | `Full_meth_sign m -> full_method_signature env m)
+      (* invoke-custom call site: keep the bootstrap target as the callee so
+         a rule can name it, e.g. StringConcatFactory for compiled string
+         concatenation *)
+      | `Custom_invoke (_id, _lp, _args, _rp, _at, cls, arrow, msig) ->
+          G.DotAccess
+            ( id_expr (class_identifier env cls),
+              token env arrow,
+              G.FN (name_of (method_signature env msig)) )
+          |> G.e)
+
+(*****************************************************************************)
+(* Instructions *)
+(*****************************************************************************)
+
+(* Opcode families. `opcode` is a single token (the semgrep grammar wraps
+ * upstream's 263-way choice in token()), so dispatch is on its text. *)
+let family (op : string) : string =
+  match String.index_opt op '/' with
+  | Some i -> String.sub op 0 i
+  | None -> op
+
+let is_invoke op = String.length op >= 6 && String.sub op 0 6 = "invoke"
+let is_const op = String.length op >= 5 && String.sub op 0 5 = "const"
+
+let is_move_result op =
+  String.length op >= 11 && String.sub op 0 11 = "move-result"
+
+(* An instruction lowers to one expression. `invoke-*` becomes a Call whose
+ * callee is the referenced method; for the instance forms the first operand
+ * is the receiver and is attached to the callee, mirroring how a Java call
+ * is shaped, so that receiver-vs-static patterns distinguish correctly. *)
+let expression (env : env) ((op, args, _nl) : CST.expression) : G.expr =
+  let opstr, optok = str env op in
+  let vals =
+    match args with
+    | None -> []
+    | Some (v0, rest) -> value env v0 :: List_.map (fun (_c, v) -> value env v) rest
+  in
+  let call_of callee operands =
+    G.Call (callee, fb (List_.map (fun e -> G.Arg e) operands)) |> G.e
+  in
+  (* the register list of an invoke is a Tuple built by `value` *)
+  let unpack_list e =
+    match e.G.e with
+    | G.Container (G.Tuple, (_, xs, _)) -> Some xs
+    | _ -> None
+  in
+  match vals with
+  | _ when is_invoke opstr -> (
+      match vals with
+      | [ regs; callee ] -> (
+          let operands = Option.value (unpack_list regs) ~default:[ regs ] in
+          let is_static = opstr = "invoke-static" || opstr = "invoke-static/range" in
+          match (callee.G.e, operands, is_static) with
+          (* instance forms: first operand is the receiver *)
+          | G.DotAccess (_cls, dot, fld), recv :: rest, false ->
+              call_of (G.DotAccess (recv, dot, fld) |> G.e) rest
+          | _ -> call_of callee operands)
+      | _ -> G.OtherExpr ((opstr, optok), List_.map (fun e -> G.E e) vals) |> G.e)
+  | [ dst; src ] when is_const opstr ->
+      G.Assign (dst, optok, src) |> G.e
+  | [ dst; src ] when family opstr = "move" || family opstr = "move-object"
+                      || family opstr = "move-wide" ->
+      G.Assign (dst, optok, src) |> G.e
+  | [ dst; fld ] when family opstr = "sget" || family opstr = "iget" ->
+      G.Assign (dst, optok, fld) |> G.e
+  | [ src; fld ] when family opstr = "sput" || family opstr = "iput" ->
+      G.Assign (fld, optok, src) |> G.e
+  | [ dst; recv; fld ] when family opstr = "iget" ->
+      G.Assign (dst, optok, G.DotAccess (recv, optok, G.FDynamic fld) |> G.e) |> G.e
+  | [ dst; ty ] when opstr = "new-instance" ->
+      let tyname =
+        match ty.G.e with
+        | G.N (G.Id (id, _)) -> G.TyN (G.Id (id, G.empty_id_info ())) |> G.t
+        | _ -> G.TyN (name_of ("?", optok)) |> G.t
+      in
+      G.Assign (dst, optok, G.New (optok, tyname, G.empty_id_info (), fb []) |> G.e)
+      |> G.e
+  | _ -> G.OtherExpr ((opstr, optok), List_.map (fun e -> G.E e) vals) |> G.e
+
+(*****************************************************************************)
+(* Statements *)
+(*****************************************************************************)
+
+(* Debug-only directives are dropped from the statement sequence so that an
+ * exact-instruction-sequence pattern still matches a body that carries them
+ * (task 4.8). `.line` is consumed for position information only. *)
+let directive (_env : env) (x : CST.directive) : G.stmt option =
+  match x with
+  (* Debug-only: dropped so an exact-instruction-sequence pattern still
+     matches a body carrying them (task 4.8). *)
+  | `Line_dire _ | `Locals_dire _ | `Regiss_dire _ | `Local_dire _
+  | `End_local_dire _ | `Rest_local_dire _ | `Prol_dire _ | `Epil_dire _
+  | `Param_dire_c83bfa2 _ | `Param_dire_19f22ef _ | `Source_dire _ ->
+      None
+  (* Structural, but not yet reconstructed: guarded ranges become try/catch
+     in task 4.12 and switch payloads in task 4.11. *)
+  | `Catch_dire _ | `Catc_dire _ | `Packed_switch_dire _
+  | `Sparse_switch_dire _ | `Array_data_dire _ ->
+      None
+
+let statement (env : env) (x : CST.statement) : G.stmt option =
+  match x with
+  | `Ellips t -> Some (G.ExprStmt (G.Ellipsis (token env t) |> G.e, sc (token env t)) |> G.s)
+  | `Choice_label s -> (
+      match s with
+      | `Label lb ->
+          let s, t = str env lb in
+          Some (G.Label ((s, t), G.Block (fb []) |> G.s) |> G.s)
+      | `Jmp_label lb ->
+          let s, t = str env lb in
+          Some (G.Label ((s, t), G.Block (fb []) |> G.s) |> G.s)
+      | `Dire d -> directive env d
+      | `Anno_dire (t, _, _, _, _) ->
+          Some (G.OtherStmt (G.OS_Todo, [ G.Tk (token env t) ]) |> G.s)
+      | `Exp e ->
+          let ex = expression env e in
+          Some (G.ExprStmt (ex, sc (G.fake ";")) |> G.s))
+
+(* Fuse `invoke-* ... / move-result* vX` into a single assignment, so that a
+ * pattern can bind the result register. Debug directives between the two
+ * have already been dropped by `statement`. *)
+let rec fuse_move_results (env : env) (stmts : (string option * G.stmt) list) :
+    G.stmt list =
+  match stmts with
+  | (Some op, ({ G.s = G.ExprStmt (call, _); _ } as s1)) :: (Some op2, s2) :: rest
+    when is_invoke op && is_move_result op2 -> (
+      match s2.G.s with
+      | G.ExprStmt ({ G.e = G.OtherExpr (_, [ G.E dst ]); _ }, _) ->
+          (G.ExprStmt (G.Assign (dst, G.fake "=", call) |> G.e, sc (G.fake ";"))
+          |> G.s)
+          :: fuse_move_results env rest
+      | _ -> s1 :: fuse_move_results env ((Some op2, s2) :: rest))
+  | (_, s) :: rest -> s :: fuse_move_results env rest
+  | [] -> []
+
+let opcode_of_statement (x : CST.statement) : string option =
+  match x with
+  | `Choice_label (`Exp ((_loc, opstr), _, _)) -> Some opstr
+  | _ -> None
+
+(*****************************************************************************)
+(* Class members *)
+(*****************************************************************************)
+
+let access_modifier (env : env) (x : CST.access_modifier) : G.attribute =
+  (* Includes the AOSP hiddenapi flags (whitelist / greylist / blacklist /
+     core-platform-api / test-api) alongside the JVM modifiers. *)
+  let s, t =
+    match x with
+    | `Public t | `Priv t | `Prot t | `Static t | `Final t | `Sync t
+    | `Vola t | `Bridge t | `Tran t | `Varargs t | `Native t | `Inte t
+    | `Abst t | `Stri t | `Synt t | `Anno t | `Enum t | `Decl t | `Whit t
+    | `Grey_a7e06de t | `Blac t | `Grey_9c01c67 t | `Grey_cf1de84 t
+    | `Grey_1cbf3dc t | `Grey_7d723aa t | `Core t | `Test t ->
+        str env t
+  in
+  G.unhandled_keywordattr (s, t)
+
+let method_attrs (env : env) (x : CST.method_access_modifiers option) :
+    G.attribute list =
+  match x with
+  | None -> []
+  | Some xs ->
+      List_.map
+        (fun m ->
+          match m with
+          | `Access_modi a -> access_modifier env a
+          | `Cons t -> G.unhandled_keywordattr (str env t))
+        xs
+
+let method_definition (env : env) ((_m, mods, msig, stmts, _end) : CST.method_definition)
+    : G.field =
+  let name = method_signature env msig in
+  let _nm, msig_body = msig in
+  (* `(...)` elides the descriptor (grammar task 1.7); it becomes a single
+     ParamEllipsis so a pattern matches any overload. *)
+  let fparams, rett =
+    match msig_body with
+    | `LPAR_rep_type_RPAR_type (_lp, params, _rp, rett) ->
+        ( List_.map
+            (fun t -> G.Param (G.param_of_type (ty_of (type_ env t))))
+            params,
+          rett )
+    | `LPAR_ellips_RPAR_type (_lp, ell, _rp, rett) ->
+        ([ G.ParamEllipsis (token env ell) ], rett)
+  in
+  let body =
+    stmts
+    |> List_.filter_map (fun s ->
+           match statement env s with
+           | None -> None
+           | Some st -> Some (opcode_of_statement s, st))
+    |> fuse_move_results env
+  in
+  let ent = { G.name = G.EN (name_of name); attrs = method_attrs env mods; tparams = None } in
+  let def =
+    {
+      G.fkind = (G.Method, snd name);
+      fparams = fb fparams;
+      frettype = Some (ty_of (type_ env rett));
+      fbody = G.FBStmt (G.Block (fb body) |> G.s);
+    }
+  in
+  G.F (G.DefStmt (ent, G.FuncDef def) |> G.s)
+
+let field_definition (env : env) ((_f, mods, fbody, init, _anns) : CST.field_definition)
+    : G.field =
+  let fname, _colon, fty = fbody in
+  let fid = match fname with `Id x -> str env x | `Num x -> str env x in
+  let attrs =
+    match mods with
+    | None -> []
+    | Some xs -> List_.map (access_modifier env) xs
+  in
+  let ent = { G.name = G.EN (name_of fid); attrs; tparams = None } in
+  let vinit = Option.map (fun (_eq, v) -> value env v) init in
+  G.F
+    (G.DefStmt
+       (ent, G.VarDef { G.vinit; vtype = Some (ty_of (type_ env fty)); vtok = None })
+    |> G.s)
+
+let class_decl (env : env) ((cdir, sdir, _src, impls, members) : CST.class_decl) :
+    G.stmt =
+  let _c, cmods, cid = cdir in
+  let cname = class_identifier env cid in
+  let _s, sid = sdir in
+  let attrs =
+    match cmods with
+    | None -> []
+    | Some xs -> List_.map (access_modifier env) xs
+  in
+  let fields =
+    List_.filter_map
+      (fun m ->
+        match m with
+        | `Meth_defi d -> Some (method_definition env d)
+        | `Field_defi d -> Some (field_definition env d)
+        | `Anno_dire _ -> None
+        | `Ellips t -> Some (G.field_ellipsis (token env t)))
+      members
+  in
+  let ent = { G.name = G.EN (name_of cname); attrs; tparams = None } in
+  let def =
+    {
+      G.ckind = (G.Class, snd cname);
+      cextends = [ (ty_of (class_identifier env sid), None) ];
+      cimplements =
+        List_.map (fun (_i, c) -> ty_of (class_identifier env c)) impls;
+      cmixins = [];
+      cparams = fb [];
+      cbody = fb fields;
+    }
+  in
+  G.DefStmt (ent, G.ClassDef def) |> G.s
+
+let lower_statements (env : env) (stmts : CST.statement list) : G.stmt list =
+  stmts
+  |> List_.filter_map (fun st ->
+         match statement env st with
+         | None -> None
+         | Some x -> Some (opcode_of_statement st, x))
+  |> fuse_move_results env
+
+(* The alternate pattern entry point admits class members as well as
+   statements, so a rule can be written as `.method ... .end method`. *)
+let semgrep_item (env : env)
+    (x : [ `Stmt of CST.statement | `Meth_defi of CST.method_definition
+         | `Field_defi of CST.field_definition ]) : G.stmt list =
+  match x with
+  | `Stmt st -> lower_statements env [ st ]
+  | `Meth_defi d -> ( match method_definition env d with G.F st -> [ st ])
+  | `Field_defi d -> ( match field_definition env d with G.F st -> [ st ])
+
+let class_definition (env : env) (x : CST.class_definition) :
+    (G.program, G.stmt list) Either.t =
+  match x with
+  | `Rep1_class_decl decls -> Either.Left (List_.map (class_decl env) decls)
+  | `Semg_stmt (_marker, items) ->
+      Either.Right (List.concat_map (semgrep_item env) items)
 
 (*****************************************************************************)
 (* Entry point *)
@@ -24,9 +479,28 @@ module H = Parse_tree_sitter_helpers
 let parse file =
   H.wrap_parser
     (fun () -> Tree_sitter_smali.Parse.file !!file)
-    (fun _cst _extras -> ([] : G.program))
+    (fun cst _extras ->
+      let env = { H.file; conv = H.line_col_to_pos file; extra = () } in
+      match class_definition env cst with
+      | Either.Left prog -> prog
+      | Either.Right stmts -> stmts)
 
-let parse_pattern str =
+(* A pattern is usually a bare instruction or a method, not a whole class.
+   Try it as written first -- that covers a full `.class` pattern -- then
+   retry behind the alternate entry point. *)
+let parse_statements_or_class str_ =
+  let res = Tree_sitter_smali.Parse.string str_ in
+  match res.errors with
+  | [] -> res
+  | _ -> Tree_sitter_smali.Parse.string ("__SEMGREP_STATEMENT " ^ str_)
+
+let parse_pattern str_ =
   H.wrap_parser
-    (fun () -> Tree_sitter_smali.Parse.string str)
-    (fun _cst _extras -> G.Pr [])
+    (fun () -> parse_statements_or_class str_)
+    (fun cst _extras ->
+      let file = Fpath.v "<pattern>" in
+      let env = { H.file; conv = H.line_col_to_pos_pattern str_; extra = () } in
+      match class_definition env cst with
+      | Either.Left prog -> G.Pr prog
+      | Either.Right [ st ] -> G.S st
+      | Either.Right sts -> G.Ss sts)
