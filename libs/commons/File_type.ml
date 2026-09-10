@@ -64,6 +64,7 @@ and pl_type =
   | Apex
   | Dart
   | Solidity
+  | Smali
   (* advanced script *)
   | Julia
   | Perl
@@ -413,6 +414,7 @@ let file_type_of_file file =
   | "cls" | "trigger" -> PL Apex
   | "dart" -> PL Dart
   | "sol" -> PL Solidity
+  | "smali" -> PL Smali
   | "vb" -> PL Vb
   | _ when UFile.is_executable file -> Binary e
   | _ when b = "Makefile" || b = "mkfile" || b = "Imakefile" -> Config Makefile

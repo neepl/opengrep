@@ -35,14 +35,8 @@
    parser_elixir.tree_sitter parser_elixir.ast_generic
    parser_ruby.tree_sitter parser_ruby.ast_generic
    parser_ql.tree_sitter parser_ql.ast_generic
-   ; Smali has no ast_generic library yet (that arrives with the CST->AST
-   ; translator). It is listed anyway because src/main/list-tree-sitter-langs.sh
-   ; globs languages/*/tree-sitter/opengrep-* and src/main/flags.sh then adds
-   ; -ltree_sitter_smali_stubs to the core link line unconditionally, so the
-   ; grammar library must be in the dependency graph or opengrep-core fails to
-   ; link. Replace with parser_smali.ast_generic once that library exists.
-   tree-sitter-lang.smali
    ; directly to generic AST
+   parser_smali.ast_generic
    parser_dart.ast_generic
    parser_cairo.ast_generic
    parser_crystal.ast_generic

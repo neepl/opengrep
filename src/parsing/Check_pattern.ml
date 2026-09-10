@@ -46,6 +46,12 @@ let lang_has_no_dollar_ids =
     | Ruby
     | Rust
     | Scala
+    (* smali identifiers may legally contain '$' -- inner classes
+     * (Lcom/a/B$Inner;), synthetic accessors (access$000), lambda classes
+     * (Foo$$ExternalSyntheticLambda0) and javac-generated enum fields
+     * ($VALUES). Metavariables in smali patterns reuse the identifier token
+     * for exactly that reason, so a leading '$' must not be rejected. *)
+    | Smali
     | Solidity
     | Ts
     | Vue ->

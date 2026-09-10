@@ -228,6 +228,7 @@ and if_stmt env (tok, e, s, sopt) =
     | Lang.Ruby
     | Lang.Ocaml
     | Lang.Scala
+    | Lang.Smali
     | Lang.Solidity
     | Lang.Php
     | Lang.Promql
@@ -314,6 +315,7 @@ and while_stmt env (tok, e, s) =
     | Lang.Lua
     | Lang.Yaml
     | Lang.Scala
+    | Lang.Smali
     | Lang.Solidity
     | Lang.Swift
     | Lang.Html
@@ -372,6 +374,7 @@ and do_while stmt env (s, e) =
     | Lang.Protobuf
     | Lang.Yaml
     | Lang.Scala
+    | Lang.Smali
     | Lang.Solidity
     | Lang.Swift
     | Lang.Html
@@ -429,6 +432,7 @@ and for_stmt env (for_tok, hdr, s) =
     | Lang.Lua
     | Lang.Yaml
     | Lang.Scala
+    | Lang.Smali
     | Lang.Solidity
     | Lang.Terraform ->
         raise Todo
@@ -532,6 +536,7 @@ and def_stmt env (entity, def_kind) =
       | Lang.Lua
       | Lang.Yaml
       | Lang.Scala
+      | Lang.Smali
       | Lang.Solidity
       | Lang.Swift
       | Lang.Html

@@ -32,6 +32,7 @@ and pl_type =
   | Apex
   | Dart
   | Solidity
+  | Smali
   | Julia
   | Perl
   | Python

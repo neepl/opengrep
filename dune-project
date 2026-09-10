@@ -338,6 +338,11 @@ parsers, especially ocamlyacc/menhir based parsers.
   (synopsis "XXX")
   (description "XXX")
 )
+(package (name parser_smali)
+  (synopsis "XXX")
+  (description "XXX")
+)
+
 (package (name parser_solidity)
   (synopsis "XXX")
   (description "XXX")

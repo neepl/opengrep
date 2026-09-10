@@ -79,6 +79,7 @@ type t = Language.t =
   | Rust
   | Scala
   | Scheme
+  | Smali
   | Solidity
   | Swift
   | Terraform
@@ -170,6 +171,7 @@ let langs_of_filename filename =
   | FT.PL FT.Apex -> [ Apex ]
   | FT.PL FT.Dart -> [ Dart  ]
   | FT.PL FT.Solidity -> [ Solidity ]
+  | FT.PL FT.Smali -> [ Smali ]
   | FT.PL (FT.Lisp Clojure) -> [ Clojure ]
   | _ -> []
 

@@ -283,6 +283,7 @@ let inspect_file_p (lang : Lang.t) path =
     | Rust
     | Scala
     | Scheme
+    | Smali
     | Solidity
     | Swift
     | Terraform

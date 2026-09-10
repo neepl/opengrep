@@ -53,6 +53,7 @@ type t = Language.t =
   | Rust
   | Scala
   | Scheme
+  | Smali
   | Solidity
   | Swift
   | Terraform
