@@ -327,6 +327,7 @@ let langs_with_error_tolerance =
     (Lang.Circom, Strict);
     (Lang.Rust, Strict);
     (Lang.Cairo, Strict);
+    (Lang.Smali, Strict);
     (Lang.Swift, Strict);
     (Lang.Kotlin, Strict);
     (Lang.Hack, Strict);

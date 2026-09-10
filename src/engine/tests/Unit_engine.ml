@@ -74,6 +74,7 @@ let full_lang_info =
     (Lang.Ruby, "ruby", ".rb");
     (Lang.Rust, "rust", ".rs");
     (Lang.Scala, "scala", ".scala");
+    (Lang.Smali, "smali", ".smali");
     (Lang.Solidity, "solidity", ".sol");
     (Lang.Swift, "swift", ".swift");
     (Lang.Terraform, "terraform", ".tf");
@@ -314,6 +315,7 @@ let maturity_tests () =
       make_maturity_tests Lang.Lua "lua" ".lua" Experimental;
       make_maturity_tests Lang.Ocaml "ocaml" ".ml" Experimental;
       make_maturity_tests Lang.R "r" ".r" Experimental;
+      make_maturity_tests Lang.Smali "smali" ".smali" Experimental;
       make_maturity_tests Lang.Solidity "solidity" ".sol" Experimental;
       make_maturity_tests Lang.Swift "swift" ".swift" Experimental;
       make_maturity_tests Lang.Julia "julia" ".jl" Experimental;
@@ -688,6 +690,7 @@ let lang_tainting_tests () =
       (Lang.Ruby, "ruby", ".rb");
       (Lang.Ruby, "rust", ".rs");
       (Lang.Scala, "scala", ".scala");
+      (Lang.Smali, "smali", ".smali");
       (Lang.Ts, "ts", ".ts");
       (Lang.Vb, "vb", ".vb");
     ]

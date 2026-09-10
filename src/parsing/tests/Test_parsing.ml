@@ -238,6 +238,10 @@ let dump_tree_sitter_cst (lang : Lang.t) (file : Fpath.t) : unit =
       Tree_sitter_cairo.Parse.file !!file
       |> dump_and_print_errors Tree_sitter_cairo.Boilerplate.dump_tree
            Tree_sitter_cairo.Boilerplate.dump_extras
+  | Lang.Smali ->
+      Tree_sitter_smali.Parse.file !!file
+      |> dump_and_print_errors Tree_sitter_smali.Boilerplate.dump_tree
+           Tree_sitter_smali.Boilerplate.dump_extras
   | Lang.Promql ->
       Tree_sitter_promql.Parse.file !!file
       |> dump_and_print_errors Tree_sitter_promql.Boilerplate.dump_tree
@@ -280,6 +284,8 @@ let test_parse_tree_sitter lang root_paths =
                  Tree_sitter_c_sharp.Parse.file file |> fail_on_error |> ignore
              | Lang.Crystal ->
                  Tree_sitter_crystal.Parse.file file |> fail_on_error |> ignore
+             | Lang.Smali ->
+                 Tree_sitter_smali.Parse.file file |> fail_on_error |> ignore
              | Lang.Kotlin ->
                  Tree_sitter_kotlin.Parse.file file |> fail_on_error |> ignore
              | Lang.Js ->

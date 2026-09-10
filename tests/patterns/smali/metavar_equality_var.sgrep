@@ -1,0 +1,3 @@
+invoke-static {$X}, Lcom/example/H;->a(Ljava/lang/String;)V
+...
+invoke-static {$X}, Lcom/example/H;->b(Ljava/lang/String;)V
