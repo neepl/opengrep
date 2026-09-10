@@ -415,7 +415,55 @@ type step2 =
 
 type cnf_step2 = step2 cnf [@@deriving show]
 
-let or_step2 ~caseless (Or xs) =
+(* Alternative spellings for an identifier, for the prefilter only.
+ *
+ * The prefilter matches identifiers against the raw target text. That works
+ * whenever the AST's spelling of a name also occurs in the source, which has
+ * been true for every language so far.
+ *
+ * Smali breaks that assumption. A class is written as a type descriptor,
+ * `Ljavax/crypto/Cipher;`, but the AST normalizes it to `javax.crypto.Cipher`
+ * -- both so that patterns keep the same shape as their Java counterparts and
+ * so that `L$CLS;` reduces to the metavariable `$CLS`. The dotted spelling
+ * never appears in a .smali file, so before this every rule naming a class was
+ * discarded by the prefilter and could not match at all.
+ *
+ * These are only ever *extra* alternatives, so a prefilter using them can
+ * never reject a target it would previously have accepted.
+ *)
+let smali_alt_spellings (id : string) : string list =
+  if String.contains id '.' then
+    [ "L" ^ String.map (function '.' -> '/' | c -> c) id ^ ";" ]
+  else []
+
+let alt_spellings_of_xlang (xlang : Xlang.t) : string -> string list =
+  match Xlang.to_lang xlang with
+  | Ok Lang.Smali -> smali_alt_spellings
+  | _ -> fun _ -> []
+
+(* All of [xs] must be present, but each may be spelled several ways. A chain
+ * of lookaheads expresses exactly that conjunction in one regexp, which keeps
+ * the prefilter as selective as the plain [Idents] conjunction it replaces.
+ *
+ * The leading \A is load-bearing, not decoration. Each lookahead scans the
+ * whole target, and the evaluator calls [unanchored_match], so without an
+ * anchor a target that fails the test is retried at every offset -- quadratic
+ * in file size, on exactly the targets the prefilter exists to reject
+ * cheaply. Anchoring is also free of any loss: a lookahead from position 0
+ * already sees the entire text. *)
+let conjunction_regexp_string (alt_spellings : string -> string list)
+    (xs : string list) : string =
+  xs
+  |> List_.map (fun id ->
+         let alts =
+           id :: alt_spellings id |> List_.map Pcre2_.quote
+           |> String.concat "|"
+         in
+         spf "(?=[\\s\\S]*(?:%s))" alts)
+  |> String.concat ""
+  |> fun re -> "\\A" ^ re
+
+let or_step2 ~caseless ~alt_spellings (Or xs) =
   let compile =
     if caseless then
       Pcre2_.pcre_compile_caseless
@@ -425,7 +473,13 @@ let or_step2 ~caseless (Or xs) =
   let step1_to_step2 =
     List_.map (function
       | StringsAndMvars ([], _) -> raise GeneralPattern
-      | StringsAndMvars (xs, _) -> Idents xs
+      | StringsAndMvars (xs, _) ->
+          (* Keep the plain [Idents] form unless some identifier is spelled
+             differently in the source than in the AST; see
+             [smali_alt_spellings]. *)
+          if List.exists (fun id -> alt_spellings id <> []) xs then
+            Regexp2_search (compile (conjunction_regexp_string alt_spellings xs))
+          else Idents xs
       | Regexp re_str -> Regexp2_search (compile re_str)
       | MvarRegexp (_mvar, re_str, _const_prop) ->
           (* The original regexp is meant to apply on a substring.
@@ -446,8 +500,8 @@ let or_step2 ~caseless (Or xs) =
   try Some (Or (step1_to_step2 xs)) with
   | GeneralPattern -> None
 
-let and_step2 ~caseless (And xs) =
-  let ys = xs |> List_.filter_map (or_step2 ~caseless) in
+let and_step2 ~caseless ~alt_spellings (And xs) =
+  let ys = xs |> List_.filter_map (or_step2 ~caseless ~alt_spellings) in
   if List_.null ys then raise GeneralPattern;
   And ys
 
@@ -596,7 +650,7 @@ let prefilter_formula_of_prefilter (pre : prefilter) :
   let x, _f = pre in
   x
 
-let compute_final_cnf ~caseless ~(is_id_mvar : is_id_mvar) f =
+let compute_final_cnf ~caseless ~alt_spellings ~(is_id_mvar : is_id_mvar) f =
   let* f = remove_not_final f in
   let cnf = cnf f in
   Log.debug (fun m -> m "cnf0 = %s" (show_cnf_step0 cnf));
@@ -607,7 +661,7 @@ let compute_final_cnf ~caseless ~(is_id_mvar : is_id_mvar) f =
      let cnf = and_step1bis_filter_general cnf in
      logger#ldebug (lazy (spf "cnf1bis = %s" (show_cnf_step1 cnf)));
   *)
-  let cnf = and_step2 ~caseless cnf in
+  let cnf = and_step2 ~caseless ~alt_spellings cnf in
   Log.debug (fun m -> m "cnf2 = %s" (show_cnf_step2 cnf));
   Some cnf
 [@@profiling]
@@ -624,8 +678,9 @@ let regexp_prefilter_of_formula ~xlang f : prefilter option =
         fun mvar -> MvarSet.mem mvar id_mvars
   in
   let caseless = Xlang.is_caseless xlang in
+  let alt_spellings = alt_spellings_of_xlang xlang in
   try
-    let* final = compute_final_cnf ~caseless ~is_id_mvar f in
+    let* final = compute_final_cnf ~caseless ~alt_spellings ~is_id_mvar f in
     Some
       ( prefilter_formula_of_cnf_step2 final,
         fun big_str ->
