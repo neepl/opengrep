@@ -32,6 +32,14 @@ type ctx = {
   (* register -> descriptor of the single invoke parameter it feeds, used
      to type an ambiguous zero constant *)
   zero_types : (string, string) Hashtbl.t;
+  (* enclosing class, and the local that `this` occupies in the method being
+     lowered (None in a static method). A bytecode invoke always names its
+     declaring class, so `Class.m()` is how *every* static call looks and
+     `this.m()` is how an instance call to a sibling method looks. Typing the
+     receiver lets the call graph resolve the latter -- see
+     Callee_resolution.identify_callee, which reads the receiver's id_type. *)
+  mutable current_class : (string * Tok.t) option;
+  mutable this_local : string option;
 }
 
 type env = ctx H.env
@@ -42,6 +50,8 @@ let new_ctx () =
     param_map = [];
     catch_ranges = [];
     zero_types = Hashtbl.create 8;
+    current_class = None;
+    this_local = None;
   }
 
 let token = H.token
@@ -88,15 +98,27 @@ let ty_of (s, t) : G.type_ = G.TyN (name_of (s, t)) |> G.t
 (* Registers are ordinary method-local variables. `v0` and `p0` are distinct
  * names; normalising p-registers onto their v-numbering needs the method's
  * `.registers` count and its argument count, which is task 4.3. *)
+(* `this` is just a register, so nothing in the instruction stream says what
+   type it holds. Name it explicitly: it is the only register whose type is
+   known without any inference, and the call graph needs it to resolve an
+   instance call to a sibling method. *)
+let reg_expr (env : env) (s, t) : G.expr =
+  match (env.H.extra.this_local, env.H.extra.current_class) with
+  | Some this_s, Some cls when String.equal s this_s ->
+      let id_info = G.empty_id_info () in
+      id_info.G.id_type := Some (ty_of cls);
+      G.N (G.Id ((s, t), id_info)) |> G.e
+  | _ -> id_expr (s, t)
+
 let register (env : env) (x : CST.register) : G.expr =
   match x with
-  | `Choice_var (`Var v) -> id_expr (str env v)
+  | `Choice_var (`Var v) -> reg_expr env (str env v)
   | `Choice_var (`Param p) ->
       (* A parameter register aliases a numbered local; use the local name so
          `p0` and `v3` in the same method are one variable. *)
       let s, t = str env p in
       let s = try List.assoc s env.H.extra.param_map with Not_found -> s in
-      id_expr (s, t)
+      reg_expr env (s, t)
   | `Semg_meta m -> id_expr (str env m)
 
 let literal (env : env) (x : CST.literal) : G.expr =
@@ -150,6 +172,33 @@ let full_method_signature (env : env) ((cls, arrow, msig) : CST.full_method_sign
   let m = method_signature env msig in
   G.DotAccess (id_expr cls_name, token env arrow, G.FN (name_of m)) |> G.e
 
+(* The text of an access-modifier keyword. Needed before [access_modifier]
+   itself because a field may be *named* after one. *)
+let access_modifier_str (env : env) (x : CST.access_modifier) : string * Tok.t =
+  match x with
+  | `Public t | `Priv t | `Prot t | `Static t | `Final t | `Sync t
+  | `Vola t | `Bridge t | `Tran t | `Varargs t | `Native t | `Inte t
+  | `Abst t | `Stri t | `Synt t | `Anno t | `Enum t | `Decl t | `Whit t
+  | `Grey_a7e06de t | `Blac t | `Grey_9c01c67 t | `Grey_cf1de84 t
+  | `Grey_1cbf3dc t | `Grey_7d723aa t | `Core t | `Test t ->
+      str env t
+
+(* A field name. Ordinarily an identifier or a number, but `public`,
+   `annotation` and the other access flags are extracted keywords, so a field
+   that happens to carry one of those names arrives on its own branch. *)
+let field_name (env : env) (x : CST.field_body) : string * Tok.t =
+  match x with
+  | `Choice_id_COLON_type (n, _colon, _ty) -> (
+      match n with `Id x -> str env x | `Num x -> str env x)
+  | `Access_modi_COLON_type (m, _colon, _ty) -> access_modifier_str env m
+
+(* The declared type of a field, whichever spelling its name took. *)
+let field_type (env : env) (x : CST.field_body) : string * Tok.t =
+  match x with
+  | `Choice_id_COLON_type (_, _, ty)
+  | `Access_modi_COLON_type (_, _, ty) ->
+      type_ env ty
+
 (* A field reference `Lcom/Foo;->NAME:Ljava/lang/String;`. *)
 let full_field_body (env : env) ((cls, arrow, fb_) : CST.full_field_body) : G.expr =
   let cls_name =
@@ -159,8 +208,7 @@ let full_field_body (env : env) ((cls, arrow, fb_) : CST.full_field_body) : G.ex
         let s, _ = type_ env t in
         (s ^ "[]", token env lb)
   in
-  let fname, _colon, _fty = fb_ in
-  let fid = match fname with `Id x -> str env x | `Num x -> str env x in
+  let fid = field_name env fb_ in
   G.DotAccess (id_expr cls_name, token env arrow, G.FN (name_of fid)) |> G.e
 
 let body (env : env) (x : CST.body) : G.expr =
@@ -169,9 +217,7 @@ let body (env : env) (x : CST.body) : G.expr =
   | `Full_field_body f -> full_field_body env f
   (* a bare field or method reference, i.e. one without its declaring
      class, as produced by an implicit reference *)
-  | `Field_body (fname, _colon, _fty) ->
-      let fid = match fname with `Id x -> str env x | `Num x -> str env x in
-      id_expr fid
+  | `Field_body fb_ -> id_expr (field_name env fb_)
   | `Meth_sign m -> id_expr (method_signature env m)
   | `Meth_sign_body b ->
       let lp = match b with
@@ -214,9 +260,7 @@ let rec value (env : env) (x : CST.value) : G.expr =
       | `Enum_ref (_e, f) -> (
           match f with
           | `Full_field_body fb_ -> full_field_body env fb_
-          | `Field_body (fname, _c, _t) ->
-              let fid = match fname with `Id x -> str env x | `Num x -> str env x in
-              id_expr fid)
+          | `Field_body fb_ -> id_expr (field_name env fb_))
       | `Suba_dire (t, _, _, _) -> G.Ellipsis (token env t) |> G.e
       | `Meth_handle (_op, _at, b) -> (
           match b with
@@ -588,16 +632,7 @@ let rec lower_statements (env : env) (stmts : CST.statement list) : G.stmt list 
 let access_modifier (env : env) (x : CST.access_modifier) : G.attribute =
   (* Includes the AOSP hiddenapi flags (whitelist / greylist / blacklist /
      core-platform-api / test-api) alongside the JVM modifiers. *)
-  let s, t =
-    match x with
-    | `Public t | `Priv t | `Prot t | `Static t | `Final t | `Sync t
-    | `Vola t | `Bridge t | `Tran t | `Varargs t | `Native t | `Inte t
-    | `Abst t | `Stri t | `Synt t | `Anno t | `Enum t | `Decl t | `Whit t
-    | `Grey_a7e06de t | `Blac t | `Grey_9c01c67 t | `Grey_cf1de84 t
-    | `Grey_1cbf3dc t | `Grey_7d723aa t | `Core t | `Test t ->
-        str env t
-  in
-  G.unhandled_keywordattr (s, t)
+  G.unhandled_keywordattr (access_modifier_str env x)
 
 let method_attrs (env : env) (x : CST.method_access_modifiers option) :
     G.attribute list =
@@ -738,15 +773,12 @@ let method_definition (env : env) ((_m, mods, msig, stmts, _end) : CST.method_de
   let _nm, msig_body = msig in
   (* `(...)` elides the descriptor (grammar task 1.7); it becomes a single
      ParamEllipsis so a pattern matches any overload. *)
-  let fparams, rett =
+  let ptypes, ellipsis_tok, rett =
     match msig_body with
     | `LPAR_rep_type_RPAR_type (_lp, params, _rp, rett) ->
-        ( List_.map
-            (fun t -> G.Param (G.param_of_type (ty_of (type_ env t))))
-            params,
-          rett )
+        (List_.map (fun t -> type_ env t) params, None, rett)
     | `LPAR_ellips_RPAR_type (_lp, ell, _rp, rett) ->
-        ([ G.ParamEllipsis (token env ell) ], rett)
+        ([], Some (token env ell), rett)
   in
   let is_static =
     match mods with
@@ -754,8 +786,43 @@ let method_definition (env : env) ((_m, mods, msig, stmts, _end) : CST.method_de
     | Some xs ->
         List.exists (fun m -> match m with `Access_modi (`Static _) -> true | _ -> false) xs
   in
-  let nargs = List.length fparams + if is_static then 0 else 1 in
+  (* Parameters are counted in *registers*, not in parameters: a long or a
+     double occupies two. Getting this wrong shifts the whole p-to-v mapping
+     and so silently renames every parameter in the method. *)
+  let width (s, _) = if String.equal s "J" || String.equal s "D" then 2 else 1 in
+  let this_regs = if is_static then 0 else 1 in
+  let nargs = this_regs + List.fold_left (fun acc t -> acc + width t) 0 ptypes in
   scan_method_body env stmts nargs;
+  env.H.extra.this_local <-
+    (if is_static then None
+     else
+       Some
+         (try List.assoc "p0" env.H.extra.param_map with Not_found -> "p0"));
+  (* Name each parameter after the register that holds it.
+     Without this the parameter list is a list of bare types and the
+     registers the body actually reads (`p1`, `p2`, ...) are unrelated
+     variables, so nothing connects an argument at a call site to the value
+     the callee uses and no interprocedural analysis -- taint in particular --
+     can cross a call. *)
+  let fparams =
+    match ellipsis_tok with
+    | Some t -> [ G.ParamEllipsis t ]
+    | None ->
+        let _, rev_ps =
+          List.fold_left
+            (fun (pidx, acc) t ->
+              let preg = Printf.sprintf "p%d" pidx in
+              let local =
+                try List.assoc preg env.H.extra.param_map with Not_found -> preg
+              in
+              let pc =
+                { (G.param_of_type (ty_of t)) with G.pname = Some (local, snd t) }
+              in
+              (pidx + width t, G.Param pc :: acc))
+            (this_regs, []) ptypes
+        in
+        List.rev rev_ps
+  in
   let body = lower_statements env stmts in
   let ent = { G.name = G.EN (name_of name); attrs = method_attrs env mods; tparams = None } in
   let def =
@@ -770,8 +837,8 @@ let method_definition (env : env) ((_m, mods, msig, stmts, _end) : CST.method_de
 
 let field_definition (env : env) ((_f, mods, fbody, init, _anns) : CST.field_definition)
     : G.field =
-  let fname, _colon, fty = fbody in
-  let fid = match fname with `Id x -> str env x | `Num x -> str env x in
+  let fid = field_name env fbody in
+  let fty = field_type env fbody in
   let attrs =
     match mods with
     | None -> []
@@ -781,13 +848,14 @@ let field_definition (env : env) ((_f, mods, fbody, init, _anns) : CST.field_def
   let vinit = Option.map (fun (_eq, v) -> value env v) init in
   G.F
     (G.DefStmt
-       (ent, G.VarDef { G.vinit; vtype = Some (ty_of (type_ env fty)); vtok = None })
+       (ent, G.VarDef { G.vinit; vtype = Some (ty_of fty); vtok = None })
     |> G.s)
 
 let class_decl (env : env) ((cdir, sdir, _src, impls, members) : CST.class_decl) :
     G.stmt =
   let _c, cmods, cid = cdir in
   let cname = class_identifier env cid in
+  env.H.extra.current_class <- Some cname;
   let _s, sid = sdir in
   let attrs =
     match cmods with
