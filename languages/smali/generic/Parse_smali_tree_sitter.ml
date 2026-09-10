@@ -26,11 +26,23 @@ module G = AST_generic
 type ctx = {
   switch_targets : (string, (string * Tok.t) list) Hashtbl.t;
   mutable param_map : (string * string) list;
+  (* start label -> (end label, handler label, exception type) for each
+     `.catch`/`.catchall`, so a guarded range can be rebuilt as a Try *)
+  mutable catch_ranges : (string * (string * (string * Tok.t) * string)) list;
+  (* register -> descriptor of the single invoke parameter it feeds, used
+     to type an ambiguous zero constant *)
+  zero_types : (string, string) Hashtbl.t;
 }
 
 type env = ctx H.env
 
-let new_ctx () = { switch_targets = Hashtbl.create 8; param_map = [] }
+let new_ctx () =
+  {
+    switch_targets = Hashtbl.create 8;
+    param_map = [];
+    catch_ranges = [];
+    zero_types = Hashtbl.create 8;
+  }
 
 let token = H.token
 let str = H.str
@@ -237,6 +249,21 @@ let is_const op = String.length op >= 5 && String.sub op 0 5 = "const"
 let is_move_result op =
   String.length op >= 11 && String.sub op 0 11 = "move-result"
 
+(* `const/4 v0, 0x0` is null, false or integer zero depending on how the
+   value is used -- the bytecode does not say which. Rules are written in
+   source-level terms, so the literal is typed from the descriptor of the
+   parameter it is eventually passed to.
+
+   Conservative by design: a register is retyped only when it is passed to
+   exactly one invoke operand position within the method, so an ambiguous
+   or reused register keeps its integer reading rather than risking a
+   false negative. Task 4.15 records whether the disassembler's own
+   register-type output should supersede this. *)
+let is_reference_descriptor (t : string) : bool =
+  (* a single descriptor letter is a primitive; anything else is a class,
+     an array, or a normalised dotted class name *)
+  String.length t <> 1 || not (String.contains "VZBSCIJFD" t.[0])
+
 (* An instruction lowers to one expression. `invoke-*` becomes a Call whose
  * callee is the referenced method; for the instance forms the first operand
  * is the receiver and is attached to the callee, mirroring how a Java call
@@ -270,6 +297,17 @@ let expression (env : env) ((op, args, _nl) : CST.expression) : G.expr =
           | _ -> call_of callee operands)
       | _ -> G.OtherExpr ((opstr, optok), List_.map (fun e -> G.E e) vals) |> G.e)
   | [ dst; src ] when is_const opstr ->
+      (* Retype an ambiguous zero from the descriptor of the parameter the
+         register feeds (task 4.13). *)
+      let src =
+        match (dst.G.e, src.G.e) with
+        | G.N (G.Id ((rname, _), _)), G.L (G.Int (Some 0L, ztok)) -> (
+            match Hashtbl.find_opt env.H.extra.zero_types rname with
+            | Some ty when is_reference_descriptor ty -> G.L (G.Null ztok) |> G.e
+            | Some "Z" -> G.L (G.Bool (false, ztok)) |> G.e
+            | _ -> src)
+        | _ -> src
+      in
       G.Assign (dst, optok, src) |> G.e
   | [ dst; src ] when family opstr = "move" || family opstr = "move-object"
                       || family opstr = "move-wide" ->
@@ -289,6 +327,7 @@ let expression (env : env) ((op, args, _nl) : CST.expression) : G.expr =
       G.Assign (dst, optok, G.New (optok, tyname, G.empty_id_info (), fb []) |> G.e)
       |> G.e
   | _ -> G.OtherExpr ((opstr, optok), List_.map (fun e -> G.E e) vals) |> G.e
+
 
 (*****************************************************************************)
 (* Control flow *)
@@ -312,6 +351,17 @@ let label_of_value (env : env) (v : CST.value) : (string * Tok.t) option =
       let s, t = str env l in
       Some (normalize_label s, t)
   | _ -> None
+
+let catch_range (env : env)
+    (r : CST.anon_choice_LCURL_label_DOTDOT_label_RCURL_label_ddeb82c) :
+    string * string * (string * Tok.t) =
+  match r with
+  | `LCURL_label_DOTDOT_label_RCURL_label (_, a, _, b, _, h)
+  | `LCURL_jmp_label_DOTDOT_jmp_label_RCURL_jmp_label (_, a, _, b, _, h) ->
+      let sa, _ = str env a in
+      let sb, _ = str env b in
+      let sh, th = str env h in
+      (normalize_label sa, normalize_label sb, (normalize_label sh, th))
 
 let is_goto op = op = "goto" || op = "goto/16" || op = "goto/32"
 let is_if op = String.length op >= 3 && String.sub op 0 3 = "if-"
@@ -466,6 +516,68 @@ let opcode_of_statement (x : CST.statement) : string option =
   | `Choice_label (`Exp ((_loc, opstr), _, _)) -> Some opstr
   | _ -> None
 
+let label_name_of_statement (env : env) (st : CST.statement) : string option =
+  match st with
+  | `Choice_label (`Label l) | `Choice_label (`Jmp_label l) ->
+      Some (normalize_label (fst (str env l)))
+  | _ -> None
+
+(* Rebuild each guarded range as a real Try, so the handler is reachable
+   from the range in the CFG rather than only from the point where the
+   `.catch` directive happens to sit. The handler body itself lives further
+   down the method under its own label, so the catch clause is a Goto to
+   it -- that is what wires the edge. *)
+let rec lower_statements (env : env) (stmts : CST.statement list) : G.stmt list =
+  match stmts with
+  | [] -> []
+  | st :: rest -> (
+      match label_name_of_statement env st with
+      | Some l when List.mem_assoc l env.H.extra.catch_ranges ->
+          let end_l, (handler, htok), exn =
+            List.assoc l env.H.extra.catch_ranges
+          in
+          let guarded, after =
+            let rec split acc = function
+              | [] -> (List.rev acc, [])
+              | x :: xs -> (
+                  match label_name_of_statement env x with
+                  | Some e when e = end_l -> (List.rev acc, xs)
+                  | _ -> split (x :: acc) xs)
+            in
+            split [] rest
+          in
+          let body = G.Block (fb (lower_statements env guarded)) |> G.s in
+          let catch_clause =
+            ( htok,
+              G.CatchPattern (G.PatId ((exn, htok), G.empty_id_info ())),
+              G.Goto (htok, (handler, htok), sc (G.fake ";")) |> G.s )
+          in
+          (G.Try (htok, body, [ catch_clause ], None, None) |> G.s)
+          :: lower_statements env after
+      | _ ->
+          (* Take the whole run of statements up to the next guarded range,
+             so invoke/move-result fusion still sees consecutive pairs. *)
+          let run, after =
+            let rec split acc = function
+              | [] -> (List.rev acc, [])
+              | x :: xs -> (
+                  match label_name_of_statement env x with
+                  | Some l when List.mem_assoc l env.H.extra.catch_ranges ->
+                      (List.rev acc, x :: xs)
+                  | _ -> split (x :: acc) xs)
+            in
+            split [ st ] rest
+          in
+          let lowered =
+            run
+            |> List_.filter_map (fun x ->
+                   match statement env x with
+                   | None -> None
+                   | Some y -> Some (opcode_of_statement x, y))
+            |> fuse_move_results env
+          in
+          lowered @ lower_statements env after)
+
 (*****************************************************************************)
 (* Class members *)
 (*****************************************************************************)
@@ -541,8 +653,70 @@ let scan_method_body (env : env) (stmts : CST.statement list) (nargs : int) : un
                    entries)
           | None -> ());
           pending_label := None
+      | `Choice_label (`Dire (`Catch_dire (_, exn, rng))) ->
+          let ename = class_identifier env exn in
+          let st, _en, hd = catch_range env rng in
+          ctx.catch_ranges <- (st, (_en, hd, fst ename)) :: ctx.catch_ranges;
+          pending_label := None
+      | `Choice_label (`Dire (`Catc_dire (_, rng))) ->
+          let st, _en, hd = catch_range env rng in
+          ctx.catch_ranges <-
+            (st, (_en, hd, "java.lang.Throwable")) :: ctx.catch_ranges;
+          pending_label := None
       | _ -> pending_label := None)
     stmts;
+  (* Type ambiguous zero constants from the descriptor of the parameter
+     they feed. Only registers used in exactly one invoke operand position
+     are recorded, so an ambiguous case keeps its integer reading. *)
+  Hashtbl.reset ctx.zero_types;
+  let uses : (string, string list) Hashtbl.t = Hashtbl.create 8 in
+  List.iter
+    (fun st ->
+      match st with
+      | `Choice_label (`Exp ((op, Some (v0, restv), _))) ->
+          let opstr = fst (str env op) in
+          if is_invoke opstr then
+            let vals = v0 :: List_.map (fun (_c, v) -> v) restv in
+            let regs =
+              match vals with
+              | `Choice_type (`List (_, Some (r0, rrest), _)) :: _ ->
+                  r0 :: List_.map (fun (_c, r) -> r) rrest
+              | _ -> []
+            in
+            let ptypes =
+              match vals with
+              | [ _; `Choice_type (`Body (`Full_meth_sign (_, _, (_, msb)))) ] -> (
+                  match msb with
+                  | `LPAR_rep_type_RPAR_type (_, ps, _, _) ->
+                      List_.map (fun t -> fst (type_ env t)) ps
+                  | `LPAR_ellips_RPAR_type _ -> [])
+              | _ -> []
+            in
+            let is_static = opstr = "invoke-static" || opstr = "invoke-static/range" in
+            let regnames =
+              List_.filter_map
+                (fun v ->
+                  match v with
+                  | `Choice_type (`Regi (`Choice_var (`Var x)))
+                  | `Choice_type (`Regi (`Choice_var (`Param x))) ->
+                      Some (fst (str env x))
+                  | _ -> None)
+                regs
+            in
+            let args = if is_static then regnames else (match regnames with _ :: t -> t | [] -> []) in
+            List.iteri
+              (fun i r ->
+                match List.nth_opt ptypes i with
+                | Some ty ->
+                    let prev = try Hashtbl.find uses r with Not_found -> [] in
+                    Hashtbl.replace uses r (ty :: prev)
+                | None -> ())
+              args
+      | _ -> ())
+    stmts;
+  Hashtbl.iter
+    (fun r tys -> match tys with [ ty ] -> Hashtbl.replace ctx.zero_types r ty | _ -> ())
+    uses;
   let base =
     match (!total, !locals) with
     | Some t, _ -> Some (t - nargs)
@@ -579,14 +753,7 @@ let method_definition (env : env) ((_m, mods, msig, stmts, _end) : CST.method_de
   in
   let nargs = List.length fparams + if is_static then 0 else 1 in
   scan_method_body env stmts nargs;
-  let body =
-    stmts
-    |> List_.filter_map (fun s ->
-           match statement env s with
-           | None -> None
-           | Some st -> Some (opcode_of_statement s, st))
-    |> fuse_move_results env
-  in
+  let body = lower_statements env stmts in
   let ent = { G.name = G.EN (name_of name); attrs = method_attrs env mods; tparams = None } in
   let def =
     {
@@ -647,14 +814,6 @@ let class_decl (env : env) ((cdir, sdir, _src, impls, members) : CST.class_decl)
     }
   in
   G.DefStmt (ent, G.ClassDef def) |> G.s
-
-let lower_statements (env : env) (stmts : CST.statement list) : G.stmt list =
-  stmts
-  |> List_.filter_map (fun st ->
-         match statement env st with
-         | None -> None
-         | Some x -> Some (opcode_of_statement st, x))
-  |> fuse_move_results env
 
 (* The alternate pattern entry point admits class members as well as
    statements, so a rule can be written as `.method ... .end method`. *)
