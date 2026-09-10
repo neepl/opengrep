@@ -749,6 +749,23 @@
     "tags": []
   },
   {
+    "id": "smali",
+    "name": "Smali",
+    "keys": [
+      "smali"
+    ],
+    "maturity": "alpha",
+    "exts": [
+      ".smali"
+    ],
+    "example_ext": null,
+    "excluded_exts": [],
+    "reverse_exts": null,
+    "shebangs": [],
+    "is_target_language": true,
+    "tags": []
+  },
+  {
     "id": "solidity",
     "name": "Solidity",
     "keys": [
