@@ -1,0 +1,1 @@
+invoke-static {"kept"}, Lcom/example/H;->sink(Ljava/lang/String;)V
