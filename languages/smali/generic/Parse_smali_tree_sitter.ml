@@ -296,15 +296,31 @@ let literal (env : env) (x : CST.literal) : G.expr =
   | `Char (l, _, _r) -> G.L (G.Char (("", token env l))) |> G.e
   | `Null t -> G.L (G.Null (token env t)) |> G.e
 
+(* The text of an access-modifier keyword. Needed before [access_modifier]
+   itself, and before [method_signature], because a field or a method may be
+   *named* after one. *)
+let access_modifier_str (env : env) (x : CST.access_modifier) : string * Tok.t =
+  match x with
+  | `Public t | `Priv t | `Prot t | `Static t | `Final t | `Sync t
+  | `Vola t | `Bridge t | `Tran t | `Varargs t | `Native t | `Inte t
+  | `Abst t | `Stri t | `Synt t | `Anno t | `Enum t | `Decl t | `Whit t
+  | `Grey_a7e06de t | `Blac t | `Grey_9c01c67 t | `Grey_cf1de84 t
+  | `Grey_1cbf3dc t | `Grey_7d723aa t | `Core t | `Test t ->
+      str env t
+
 (* A method reference `Lcom/Foo;->bar(I)V`. The parameter descriptor is not
  * currently part of the lowered callee, so a pattern naming one overload
  * matches every overload of that name on that class. See the note in the
  * change's task 4.6. *)
-let method_signature (env : env) ((nm, _body) : CST.method_signature) :
-    string * Tok.t =
-  match nm with
-  | `Opt_DASH_id (_dash, id) -> str env id
-  | `Num n -> str env n
+let method_signature (env : env) (x : CST.method_signature) : string * Tok.t =
+  match x with
+  | `Choice_opt_DASH_id_meth_sign_body (nm, _body) -> (
+      match nm with
+      | `Opt_DASH_id (_dash, id) -> str env id
+      | `Num n -> str env n)
+  (* a method *named* after an access flag, `synchronized(...)`, which Kotlin
+     emits and an obfuscator produces *)
+  | `Access_modi_meth_sign_body (m, _body) -> access_modifier_str env m
 
 let full_method_signature (env : env) ((cls, arrow, msig) : CST.full_method_signature)
     : G.expr =
@@ -317,17 +333,6 @@ let full_method_signature (env : env) ((cls, arrow, msig) : CST.full_method_sign
   in
   let m = method_signature env msig in
   G.DotAccess (id_expr cls_name, token env arrow, G.FN (name_of m)) |> G.e
-
-(* The text of an access-modifier keyword. Needed before [access_modifier]
-   itself because a field may be *named* after one. *)
-let access_modifier_str (env : env) (x : CST.access_modifier) : string * Tok.t =
-  match x with
-  | `Public t | `Priv t | `Prot t | `Static t | `Final t | `Sync t
-  | `Vola t | `Bridge t | `Tran t | `Varargs t | `Native t | `Inte t
-  | `Abst t | `Stri t | `Synt t | `Anno t | `Enum t | `Decl t | `Whit t
-  | `Grey_a7e06de t | `Blac t | `Grey_9c01c67 t | `Grey_cf1de84 t
-  | `Grey_1cbf3dc t | `Grey_7d723aa t | `Core t | `Test t ->
-      str env t
 
 (* A field name. Ordinarily an identifier or a number, but `public`,
    `annotation` and the other access flags are extracted keywords, so a field
@@ -963,7 +968,12 @@ let scan_method_body (env : env) (stmts : CST.statement list) (nargs : int) : un
             in
             let ptypes =
               match vals with
-              | [ _; `Choice_type (`Body (`Full_meth_sign (_, _, (_, msb)))) ] -> (
+              | [ _; `Choice_type (`Body (`Full_meth_sign (_, _, msig))) ] -> (
+                  let msb =
+                    match msig with
+                    | `Choice_opt_DASH_id_meth_sign_body (_, b) -> b
+                    | `Access_modi_meth_sign_body (_, b) -> b
+                  in
                   match msb with
                   | `LPAR_rep_type_RPAR_type (_, ps, _, _) ->
                       List_.map (fun t -> fst (type_ env t)) ps
@@ -1009,7 +1019,11 @@ let scan_method_body (env : env) (stmts : CST.statement list) (nargs : int) : un
 let method_definition (env : env) ((_m, mods, msig, stmts, _end) : CST.method_definition)
     : G.field =
   let name = method_signature env msig in
-  let _nm, msig_body = msig in
+  let msig_body =
+    match msig with
+    | `Choice_opt_DASH_id_meth_sign_body (_, b) -> b
+    | `Access_modi_meth_sign_body (_, b) -> b
+  in
   (* `(...)` elides the descriptor (grammar task 1.7); it becomes a single
      ParamEllipsis so a pattern matches any overload. *)
   let ptypes, ellipsis_tok, rett =
