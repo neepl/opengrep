@@ -31,3 +31,24 @@
     sget-object v0, Lcom/example/KeywordNames;->interface:Ljava/lang/String;
     return-object v0
 .end method
+
+# A *method* may be named after an access flag too, for the same reason.
+# `synchronized` is what Kotlin emits for the stdlib's synchronized-block
+# helper (kotlin/StandardKt__SynchronizedKt, kotlinx/coroutines/internal/
+# SynchronizedKt); `bridge` and `native` are what an obfuscator produces.
+# Deciding between "another modifier" and "the method name" needs the `(`
+# that follows, one token past LR(1), so it rests on a GLR conflict.
+.method private static final synchronized(Ljava/lang/Object;Lkotlin/jvm/functions/Function0;)Ljava/lang/Object;
+    .registers 3
+    return-object p0
+.end method
+
+.method public bridge()V
+    .registers 1
+    return-void
+.end method
+
+.method public static native(I)I
+    .registers 2
+    return p0
+.end method
