@@ -221,6 +221,33 @@ let reg_expr ?raw (env : env) (s, t) : G.expr =
       id_info.G.id_type := Some (ty_of (chosen, t));
       G.N (G.Id ((s, t), id_info)) |> G.e
 
+(* Every register from `a` to `b` inclusive. Falls back to the two endpoints
+   if either is not a plain numbered register, which is the only shape the
+   range syntax actually permits but is worth not crashing on. *)
+let expand_register_range (env : env) (a : G.expr) (b : G.expr) : G.expr list =
+  let name_tok e =
+    match e.G.e with G.N (G.Id ((n, t), _)) -> Some (n, t) | _ -> None
+  in
+  let split n =
+    if String.length n < 2 then None
+    else
+      match int_of_string_opt (String.sub n 1 (String.length n - 1)) with
+      | Some i -> Some (n.[0], i)
+      | None -> None
+  in
+  match (name_tok a, name_tok b) with
+  | Some (na, ta), Some (nb, _) -> (
+      match (split na, split nb) with
+      | Some (pa, ia), Some (pb, ib) when Char.equal pa pb && ia <= ib ->
+          List.init (ib - ia + 1) (fun k ->
+              let raw = Printf.sprintf "%c%d" pa (ia + k) in
+              let mapped =
+                try List.assoc raw env.H.extra.param_map with Not_found -> raw
+              in
+              reg_expr ~raw env (mapped, ta))
+      | _ -> [ a; b ])
+  | _ -> [ a; b ]
+
 let register (env : env) (x : CST.register) : G.expr =
   match x with
   | `Choice_var (`Var v) -> reg_expr env (str env v)
@@ -359,7 +386,13 @@ let rec value (env : env) (x : CST.value) : G.expr =
       | `Range (l, r_, r) ->
           let xs =
             match r_ with
-            | `Regi_DOTDOT_regi (a, _dd, b) -> [ register env a; register env b ]
+            | `Regi_DOTDOT_regi (a, _dd, b) ->
+                (* `{v5 .. v11}` names seven registers, not two. The /range
+                   invoke forms use it whenever a call has more arguments than
+                   the short form can encode, so keeping only the endpoints
+                   loses every argument in between -- and with it any taint
+                   flowing through one. *)
+                expand_register_range env (register env a) (register env b)
             | `Num_DOTDOT_num (a, _dd, b) ->
                 [ id_expr (str env a); id_expr (str env b) ]
             | `Jmp_label_DOTDOT_jmp_label (a, _dd, b) ->
@@ -437,7 +470,16 @@ let expression (env : env) ((op, args, _nl) : CST.expression) : G.expr =
   (* the register list of an invoke is a Tuple built by `value` *)
   let unpack_list e =
     match e.G.e with
-    | G.Container (G.Tuple, (_, xs, _)) -> Some xs
+    | G.Container (G.Tuple, (_, xs, _)) ->
+        (* A range inside the operand list is itself a tuple; flatten one
+           level so the invoke sees individual arguments. *)
+        Some
+          (List.concat_map
+             (fun x ->
+               match x.G.e with
+               | G.Container (G.Tuple, (_, inner, _)) -> inner
+               | _ -> [ x ])
+             xs)
     | _ -> None
   in
   match vals with
