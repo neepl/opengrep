@@ -29,9 +29,14 @@ type ctx = {
   (* start label -> (end label, handler label, exception type) for each
      `.catch`/`.catchall`, so a guarded range can be rebuilt as a Try *)
   mutable catch_ranges : (string * (string * (string * Tok.t) * string)) list;
-  (* register -> descriptor of the single invoke parameter it feeds, used
-     to type an ambiguous zero constant *)
-  zero_types : (string, string) Hashtbl.t;
+  (* byte position of a `const` opcode -> descriptor of the parameter
+     position that definition reaches. Keyed per *definition*, not per
+     register: Dalvik reuses registers constantly, and 35% of registers in
+     a real APK feed parameter positions with disagreeing descriptors
+     purely because they were reassigned in between. A per-register map
+     therefore either mis-types or, being conservative, gives up on a third
+     of the cases. *)
+  zero_types : (int, string) Hashtbl.t;
   (* enclosing class, and the local that `this` occupies in the method being
      lowered (None in a static method). A bytecode invoke always names its
      declaring class, so `Class.m()` is how *every* static call looks and
@@ -345,10 +350,19 @@ let expression (env : env) ((op, args, _nl) : CST.expression) : G.expr =
          register feeds (task 4.13). *)
       let src =
         match (dst.G.e, src.G.e) with
-        | G.N (G.Id ((rname, _), _)), G.L (G.Int (Some 0L, ztok)) -> (
-            match Hashtbl.find_opt env.H.extra.zero_types rname with
-            | Some ty when is_reference_descriptor ty -> G.L (G.Null ztok) |> G.e
-            | Some "Z" -> G.L (G.Bool (false, ztok)) |> G.e
+        | G.N (G.Id (_, _)), G.L (G.Int (Some n, ztok)) when n = 0L || n = 1L -> (
+            match
+              ( Hashtbl.find_opt env.H.extra.zero_types
+                  (Tok.bytepos_of_tok optok),
+                n )
+            with
+            | Some ty, 0L when is_reference_descriptor ty -> G.L (G.Null ztok) |> G.e
+            (* There is no boolean in Dalvik: `Z` is an int that is 0 or 1, and
+               the parameter descriptor is the only thing that says which it
+               means. Typing 0 alone was half the job -- `setX(true)` is at
+               least as common in Android rules as `setX(false)`. *)
+            | Some "Z", 0L -> G.L (G.Bool (false, ztok)) |> G.e
+            | Some "Z", 1L -> G.L (G.Bool (true, ztok)) |> G.e
             | _ -> src)
         | _ -> src
       in
@@ -703,17 +717,27 @@ let scan_method_body (env : env) (stmts : CST.statement list) (nargs : int) : un
           pending_label := None
       | _ -> pending_label := None)
     stmts;
-  (* Type ambiguous zero constants from the descriptor of the parameter
-     they feed. Only registers used in exactly one invoke operand position
-     are recorded, so an ambiguous case keeps its integer reading. *)
+  (* Type an ambiguous constant from the descriptor of the parameter
+     position that *this* definition reaches: walk the method in order,
+     remember the pending `const` for each register, and settle it at the
+     register's first use as an invoke operand. A later `const` to the same
+     register replaces the pending one, so a reassigned register types each
+     of its definitions independently. *)
   Hashtbl.reset ctx.zero_types;
-  let uses : (string, string list) Hashtbl.t = Hashtbl.create 8 in
+  let pending : (string, int) Hashtbl.t = Hashtbl.create 8 in
   List.iter
     (fun st ->
       match st with
       | `Choice_label (`Exp ((op, Some (v0, restv), _))) ->
           let opstr = fst (str env op) in
-          if is_invoke opstr then
+          if is_const opstr then (
+            match v0 with
+            | `Choice_type (`Regi (`Choice_var (`Var x)))
+            | `Choice_type (`Regi (`Choice_var (`Param x))) ->
+                Hashtbl.replace pending (fst (str env x))
+                  (Tok.bytepos_of_tok (token env op))
+            | _ -> ())
+          else if is_invoke opstr then
             let vals = v0 :: List_.map (fun (_c, v) -> v) restv in
             let regs =
               match vals with
@@ -744,17 +768,16 @@ let scan_method_body (env : env) (stmts : CST.statement list) (nargs : int) : un
             let args = if is_static then regnames else (match regnames with _ :: t -> t | [] -> []) in
             List.iteri
               (fun i r ->
-                match List.nth_opt ptypes i with
-                | Some ty ->
-                    let prev = try Hashtbl.find uses r with Not_found -> [] in
-                    Hashtbl.replace uses r (ty :: prev)
-                | None -> ())
+                match (List.nth_opt ptypes i, Hashtbl.find_opt pending r) with
+                | Some ty, Some pos ->
+                    (* First use settles the definition; drop the pending so a
+                       later position cannot retype the same constant. *)
+                    Hashtbl.replace ctx.zero_types pos ty;
+                    Hashtbl.remove pending r
+                | _ -> ())
               args
       | _ -> ())
     stmts;
-  Hashtbl.iter
-    (fun r tys -> match tys with [ ty ] -> Hashtbl.replace ctx.zero_types r ty | _ -> ())
-    uses;
   let base =
     match (!total, !locals) with
     | Some t, _ -> Some (t - nargs)
