@@ -316,6 +316,52 @@ and leaf_step1 f =
       metavarcond_step1 x
 *)
 
+(* The classes a smali pattern names, in the dotted spelling the rest of
+ * this module uses.
+ *
+ * An instance invoke names both a receiver register and a declaring class,
+ * but the Java-shaped call it lowers to has one slot for the two:
+ * `DotAccess(recv, m)` keeps the receiver and drops the class. That costs
+ * the matcher precision, but it costs the prefilter everything -- a rule
+ * naming `Ljavax/crypto/Cipher;` becomes a rule naming only `getInstance`,
+ * and is offered every file in the APK.
+ *
+ * Reading the descriptors back out of the pattern text restores the
+ * file-level condition. It is sound: a smali pattern is smali source, so a
+ * class it names must appear verbatim in any file whose instructions it can
+ * match. Only the prefilter is affected, so a mistake here can only reject a
+ * target -- hence anything that could be a metavariable (`L$CLS;`) is left
+ * out. *)
+let smali_class_idents (pstr : string) : string list =
+  let n = String.length pstr in
+  let is_body c =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+    || Char.equal c '_' || Char.equal c '$' || Char.equal c '/'
+  in
+  let is_word c =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+    || Char.equal c '_'
+  in
+  let acc = ref [] in
+  let i = ref 0 in
+  while !i < n do
+    (if Char.equal pstr.[!i] 'L' && (!i =|= 0 || not (is_word pstr.[!i - 1])) then begin
+       let j = ref (!i + 1) in
+       while !j < n && is_body pstr.[!j] do
+         incr j
+       done;
+       if !j < n && !j > !i + 1 && Char.equal pstr.[!j] ';' then begin
+         let body = String.sub pstr (!i + 1) (!j - !i - 1) in
+         if not (Char.equal body.[0] '$') then
+           acc :=
+             String.map (function '/' -> '.' | c -> c) body :: !acc;
+         i := !j
+       end
+     end);
+    incr i
+  done;
+  List_.deduplicate_gen ~get_key:Fun.id !acc
+
 let rec (and_step1 : is_id_mvar:is_id_mvar -> cnf_step0 -> cnf_step1) =
  fun ~is_id_mvar cnf ->
   match cnf with
@@ -338,8 +384,15 @@ and leaf_step1 ~is_id_mvar f =
 
 and xpat_step1 pat =
   match pat.XP.pat with
-  | XP.Sem (pat, lang) ->
-      let ids, mvars = Analyze_pattern.extract_strings_and_mvars ~lang pat in
+  | XP.Sem (sem_pat, lang) ->
+      let ids, mvars =
+        Analyze_pattern.extract_strings_and_mvars ~lang sem_pat
+      in
+      let ids =
+        match lang with
+        | Lang.Smali -> smali_class_idents (fst pat.XP.pstr) @ ids
+        | __else__ -> ids
+      in
       Some (StringsAndMvars (ids, mvars))
   (* less: could also extract ids and mvars, but maybe no need to
    * prefilter for spacegrep; it is probably fast enough already
@@ -450,16 +503,25 @@ let alt_spellings_of_xlang (xlang : Xlang.t) : string -> string list =
  * anchor a target that fails the test is retried at every offset -- quadratic
  * in file size, on exactly the targets the prefilter exists to reject
  * cheaply. Anchoring is also free of any loss: a lookahead from position 0
- * already sees the entire text. *)
+ * already sees the entire text.
+ *
+ * The quantifier is lazy for a related reason. Greedy, each lookahead runs to
+ * the end of the target and backtracks one character at a time, so a term
+ * near the front costs a backtrack per byte of the file -- and PCRE2's match
+ * limit (1e6) then *fails* the match on a large target, which the caller
+ * reads as "irrelevant" and skips the file. Lazy stops at the first
+ * occurrence instead. Deduplicating first halves the work again, since the
+ * same class routinely reaches here from both the AST and the pattern text. *)
 let conjunction_regexp_string (alt_spellings : string -> string list)
     (xs : string list) : string =
   xs
+  |> List_.deduplicate_gen ~get_key:Fun.id
   |> List_.map (fun id ->
          let alts =
            id :: alt_spellings id |> List_.map Pcre2_.quote
            |> String.concat "|"
          in
-         spf "(?=[\\s\\S]*(?:%s))" alts)
+         spf "(?=[\\s\\S]*?(?:%s))" alts)
   |> String.concat ""
   |> fun re -> "\\A" ^ re
 

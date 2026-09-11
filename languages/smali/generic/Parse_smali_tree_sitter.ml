@@ -44,6 +44,7 @@ type ctx = {
      receiver lets the call graph resolve the latter -- see
      Callee_resolution.identify_callee, which reads the receiver's id_type. *)
   mutable current_class : (string * Tok.t) option;
+  mutable super_class : string option;
   mutable this_local : string option;
   (* line -> [(register, verifier type)] from baksmali --register-info.
      dexlib2 runs the same dataflow the runtime verifier does and prints the
@@ -64,6 +65,7 @@ let new_ctx () =
     catch_ranges = [];
     zero_types = Hashtbl.create 8;
     current_class = None;
+    super_class = None;
     this_local = None;
     reg_types = Hashtbl.create 64;
   }
@@ -456,7 +458,21 @@ let is_reference_descriptor (t : string) : bool =
 (* An instruction lowers to one expression. `invoke-*` becomes a Call whose
  * callee is the referenced method; for the instance forms the first operand
  * is the receiver and is attached to the callee, mirroring how a Java call
- * is shaped, so that receiver-vs-static patterns distinguish correctly. *)
+ * is shaped, so that receiver-vs-static patterns distinguish correctly.
+ *
+ * That shape has one slot for what bytecode gives two, so an instance
+ * invoke's declaring class is not represented and patterns compare the
+ * method name alone. The class is not lost: it is recovered from the
+ * pattern text as a prefilter condition (Analyze_rule.smali_class_idents),
+ * which restricts a rule to files that actually reference the class.
+ *
+ * `<init>` is the exception, and has to be. A constructor pattern that
+ * compared only the name would match every `invoke-direct` in the APK, four
+ * orders of magnitude of noise, so `new-instance` + `invoke-direct <init>`
+ * is folded into the `New` node Java produces, which does carry the type.
+ * A typed receiver was tried instead and does not work: Naming_AST re-derives
+ * a register's type from its definition, and a receiver is routinely a
+ * subclass of the class the invoke declares. *)
 let expression (env : env) ((op, args, _nl) : CST.expression) : G.expr =
   let opstr, optok = str env op in
   let vals =
@@ -490,8 +506,54 @@ let expression (env : env) ((op, args, _nl) : CST.expression) : G.expr =
           let is_static = opstr = "invoke-static" || opstr = "invoke-static/range" in
           match (callee.G.e, operands, is_static) with
           (* instance forms: first operand is the receiver *)
-          | G.DotAccess (_cls, dot, fld), recv :: rest, false ->
-              call_of (G.DotAccess (recv, dot, fld) |> G.e) rest
+          | G.DotAccess (cls, dot, fld), recv :: rest, false -> (
+              let cls_name =
+                match cls.G.e with G.N (G.Id (id, _)) -> Some id | _ -> None
+              in
+              let is_ctor =
+                match fld with
+                | G.FN (G.Id (("<init>", _), _)) -> true
+                | _ -> false
+              in
+              (* Every constructor begins by invoking its own or its
+                 superclass's constructor on `this`. That is not an object
+                 creation, and rewriting it as one would retype `this` for
+                 the rest of the method. The declaring class has to be part
+                 of the test: `p0` is only `this` until the method overwrites
+                 it, and real code does reuse it as a scratch register. *)
+              let on_this =
+                let recv_is_this =
+                  match (recv.G.e, env.H.extra.this_local) with
+                  | G.N (G.Id ((s, _), _)), Some tl -> String.equal s tl
+                  | _ -> false
+                in
+                let declares_enclosing =
+                  match cls_name with
+                  | None -> false
+                  | Some (c, _) ->
+                      let same = function
+                        | Some x -> String.equal c x
+                        | None -> false
+                      in
+                      same (Option.map fst env.H.extra.current_class)
+                      || same env.H.extra.super_class
+                in
+                recv_is_this && declares_enclosing
+              in
+              match (is_ctor, on_this, cls_name) with
+              | true, false, Some id ->
+                  G.Assign
+                    ( recv,
+                      optok,
+                      G.New
+                        ( optok,
+                          G.TyN (G.Id (id, G.empty_id_info ())) |> G.t,
+                          G.empty_id_info (),
+                          fb (List_.map (fun e -> G.Arg e) rest) )
+                      |> G.e )
+                  |> G.e
+              | _ ->
+                  call_of (G.DotAccess (recv, dot, fld) |> G.e) rest)
           | _ -> call_of callee operands)
       | _ -> G.OtherExpr ((opstr, optok), List_.map (fun e -> G.E e) vals) |> G.e)
   | [ dst; src ] when is_const opstr ->
@@ -1029,6 +1091,7 @@ let class_decl (env : env) ((cdir, sdir, _src, impls, members) : CST.class_decl)
   let cname = class_identifier env cid in
   env.H.extra.current_class <- Some cname;
   let _s, sid = sdir in
+  env.H.extra.super_class <- Some (fst (class_identifier env sid));
   let attrs =
     match cmods with
     | None -> []
