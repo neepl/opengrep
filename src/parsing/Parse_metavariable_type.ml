@@ -18,7 +18,7 @@ module G = AST_generic
    what a rule author naturally writes and what every other type comparison
    in this language uses. Accept either spelling and hand the parser a
    descriptor, which is the only form the grammar has a production for. *)
-let smali_descriptor_of str =
+let rec smali_descriptor_of str =
   let n = String.length str in
   (* `=` is string equality here; `=|=` is int, and chars compare by match. *)
   let starts_with c = n > 0 && Char.equal str.[0] c in
@@ -33,7 +33,23 @@ let smali_descriptor_of str =
     (n > 2 && starts_with 'L' && ends_with ';') || starts_with '[' || is_primitive
   in
   if is_descriptor then str
-  else "L" ^ String.map (function '.' -> '/' | c -> c) str ^ ";"
+  else if n > 2 && String.equal (String.sub str (n - 2) 2) "[]" then
+    (* `byte[]`, `java.lang.String[]`: the source-level array spelling, which
+       is what a rule author writes and which no descriptor production
+       accepts. *)
+    "[" ^ smali_descriptor_of (String.sub str 0 (n - 2))
+  else
+    match str with
+    | "void" -> "V"
+    | "boolean" -> "Z"
+    | "byte" -> "B"
+    | "short" -> "S"
+    | "char" -> "C"
+    | "int" -> "I"
+    | "long" -> "J"
+    | "float" -> "F"
+    | "double" -> "D"
+    | _ -> "L" ^ String.map (function '.' -> '/' | c -> c) str ^ ";"
 
 let wrap_type_expr lang str =
   match lang with

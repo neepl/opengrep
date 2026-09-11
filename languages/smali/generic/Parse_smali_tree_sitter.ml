@@ -109,10 +109,15 @@ let ty_of (s, t) : G.type_ = G.TyN (name_of (s, t)) |> G.t
 
 (* `Lcom/foo/Bar;` -> `com.foo.Bar`, matching how class references are
    normalised everywhere else. *)
-let descriptor_to_dotted (d : string) : string =
+let rec descriptor_to_dotted (d : string) : string =
   let n = String.length d in
   if n > 2 && d.[0] = 'L' && d.[n - 1] = ';' then
     String.map (function '/' -> '.' | c -> c) (String.sub d 1 (n - 2))
+  else if n > 1 && d.[0] = '[' then
+    (* An array must come out the way [type_] renders one, `B[]` rather than
+       `[B`, or a register's recorded type never agrees with the type a
+       pattern writes for it. *)
+    descriptor_to_dotted (String.sub d 1 (n - 1)) ^ "[]"
   else d
 
 (* Parse the register-type comments baksmali emits with --register-info.
