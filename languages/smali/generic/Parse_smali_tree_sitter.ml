@@ -45,6 +45,14 @@ type ctx = {
      Callee_resolution.identify_callee, which reads the receiver's id_type. *)
   mutable current_class : (string * Tok.t) option;
   mutable this_local : string option;
+  (* line -> [(register, verifier type)] from baksmali --register-info.
+     dexlib2 runs the same dataflow the runtime verifier does and prints the
+     type of every register at every program point, which is strictly better
+     than anything inferred from the instruction stream alone: it is correct
+     across branches and merges, and it survives the register reuse that
+     makes a register's own name meaningless as a type key. Reading it is
+     preferred over re-deriving it. *)
+  reg_types : (int, (string * string) list) Hashtbl.t;
 }
 
 type env = ctx H.env
@@ -57,6 +65,7 @@ let new_ctx () =
     zero_types = Hashtbl.create 8;
     current_class = None;
     this_local = None;
+    reg_types = Hashtbl.create 64;
   }
 
 let token = H.token
@@ -96,6 +105,85 @@ let name_of (s, t) : G.name = G.Id ((s, t), G.empty_id_info ())
 let id_expr (s, t) : G.expr = G.N (name_of (s, t)) |> G.e
 let ty_of (s, t) : G.type_ = G.TyN (name_of (s, t)) |> G.t
 
+(* `Lcom/foo/Bar;` -> `com.foo.Bar`, matching how class references are
+   normalised everywhere else. *)
+let descriptor_to_dotted (d : string) : string =
+  let n = String.length d in
+  if n > 2 && d.[0] = 'L' && d.[n - 1] = ';' then
+    String.map (function '/' -> '.' | c -> c) (String.sub d 1 (n - 2))
+  else d
+
+(* Parse the register-type comments baksmali emits with --register-info.
+   They precede the instruction they describe:
+
+     #v0=(Reference,Landroid/webkit/WebSettings;);v1=(One);
+     invoke-virtual {v0, v1}, ...->setJavaScriptEnabled(Z)V
+
+   Comments are tree-sitter `extras` and so never reach the CST; reading the
+   file directly is the cheapest way to recover them, keyed by the line of
+   the instruction they annotate. *)
+let load_register_info (file : Fpath.t) : (int, (string * string) list) Hashtbl.t =
+  let tbl = Hashtbl.create 64 in
+  (try
+     let ic = open_in (Fpath.to_string file) in
+     let pending = ref [] in
+     let lineno = ref 0 in
+     (try
+        while true do
+          let line = input_line ic in
+          incr lineno;
+          let t = String.trim line in
+          if String.length t > 1 && t.[0] = '#' && String.contains t '=' then (
+            (* Scan for `reg=(type)` groups. Splitting on ';' would be wrong:
+               a class descriptor ends in ';', so `Reference,Lcom/foo/Bar;`
+               contains one. A type never contains ')', so the parenthesis
+               is the reliable delimiter. *)
+            let n = String.length t in
+            let i = ref 1 in
+            while !i < n do
+              match String.index_from_opt t !i '=' with
+              | None -> i := n
+              | Some eq ->
+                  if eq + 1 < n && t.[eq + 1] = '(' then (
+                    match String.index_from_opt t (eq + 1) ')' with
+                    | None -> i := n
+                    | Some cl ->
+                        (* the register name runs back to the previous
+                           delimiter *)
+                        let start =
+                          let j = ref (eq - 1) in
+                          while
+                            !j >= 1
+                            && (match t.[!j] with
+                                | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> true
+                                | _ -> false)
+                          do
+                            decr j
+                          done;
+                          !j + 1
+                        in
+                        let reg = String.sub t start (eq - start) in
+                        let ty = String.sub t (eq + 2) (cl - eq - 2) in
+                        if reg <> "" && ty <> "" then
+                          pending := (reg, ty) :: !pending;
+                        i := cl + 1)
+                  else i := eq + 1
+            done)
+          else if t <> "" then (
+            if !pending <> [] then Hashtbl.replace tbl !lineno (List.rev !pending);
+            pending := [])
+        done
+      with End_of_file -> ());
+     close_in ic
+   with Sys_error _ -> ());
+  tbl
+
+(* The verifier's type for a register at a given line, if it recorded one. *)
+let verifier_type (env : ctx H.env) (reg : string) (t : Tok.t) : string option =
+  match Hashtbl.find_opt env.H.extra.reg_types (Tok.line_of_tok t) with
+  | None -> None
+  | Some entries -> List.assoc_opt reg entries
+
 (*****************************************************************************)
 (* Operands *)
 (*****************************************************************************)
@@ -107,23 +195,42 @@ let ty_of (s, t) : G.type_ = G.TyN (name_of (s, t)) |> G.t
    type it holds. Name it explicitly: it is the only register whose type is
    known without any inference, and the call graph needs it to resolve an
    instance call to a sibling method. *)
-let reg_expr (env : env) (s, t) : G.expr =
-  match (env.H.extra.this_local, env.H.extra.current_class) with
-  | Some this_s, Some cls when String.equal s this_s ->
+let reg_expr ?raw (env : env) (s, t) : G.expr =
+  (* The verifier's own type, where it recorded one, in preference to
+     anything we could infer. It is the only source that is correct across
+     branches and unaffected by register reuse. `raw` is the register as
+     written (`p0`), which is what the comments name, before the p-to-v
+     normalisation. *)
+  let from_verifier =
+    match verifier_type env (Option.value raw ~default:s) t with
+    | Some ty when String.length ty > 10 && String.sub ty 0 10 = "Reference," ->
+        Some (descriptor_to_dotted (String.sub ty 10 (String.length ty - 10)))
+    | _ -> None
+  in
+  let declared =
+    match (env.H.extra.this_local, env.H.extra.current_class) with
+    | Some this_s, Some (cls, _) when String.equal s this_s -> Some cls
+    | _ -> None
+  in
+  match (from_verifier, declared) with
+  | None, None -> id_expr (s, t)
+  | v, d ->
       let id_info = G.empty_id_info () in
-      id_info.G.id_type := Some (ty_of cls);
+      (* `this` is known exactly; otherwise take what the verifier says. *)
+      let chosen = match d with Some c -> c | None -> Option.get v in
+      id_info.G.id_type := Some (ty_of (chosen, t));
       G.N (G.Id ((s, t), id_info)) |> G.e
-  | _ -> id_expr (s, t)
 
 let register (env : env) (x : CST.register) : G.expr =
   match x with
   | `Choice_var (`Var v) -> reg_expr env (str env v)
   | `Choice_var (`Param p) ->
       (* A parameter register aliases a numbered local; use the local name so
-         `p0` and `v3` in the same method are one variable. *)
-      let s, t = str env p in
-      let s = try List.assoc s env.H.extra.param_map with Not_found -> s in
-      reg_expr env (s, t)
+         `p0` and `v3` in the same method are one variable. The verifier
+         comments still name it `p0`, so pass the original through. *)
+      let s0, t = str env p in
+      let s = try List.assoc s0 env.H.extra.param_map with Not_found -> s0 in
+      reg_expr ~raw:s0 env (s, t)
   | `Semg_meta m -> id_expr (str env m)
 
 let literal (env : env) (x : CST.literal) : G.expr =
@@ -934,7 +1041,11 @@ let parse file =
   H.wrap_parser
     (fun () -> Tree_sitter_smali.Parse.file !!file)
     (fun cst _extras ->
-      let env = { H.file; conv = H.line_col_to_pos file; extra = new_ctx () } in
+      let extra = new_ctx () in
+      Hashtbl.iter
+        (fun k v -> Hashtbl.replace extra.reg_types k v)
+        (load_register_info file);
+      let env = { H.file; conv = H.line_col_to_pos file; extra } in
       match class_definition env cst with
       | Either.Left prog -> prog
       | Either.Right stmts -> stmts)

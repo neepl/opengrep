@@ -13,10 +13,36 @@
 open Common
 module G = AST_generic
 
+(* A smali type is written as a descriptor, `Landroid/webkit/WebView;`, but
+   the AST normalises it to `android.webkit.WebView`, and that dotted form is
+   what a rule author naturally writes and what every other type comparison
+   in this language uses. Accept either spelling and hand the parser a
+   descriptor, which is the only form the grammar has a production for. *)
+let smali_descriptor_of str =
+  let n = String.length str in
+  (* `=` is string equality here; `=|=` is int, and chars compare by match. *)
+  let starts_with c = n > 0 && Char.equal str.[0] c in
+  let ends_with c = n > 0 && Char.equal str.[n - 1] c in
+  let is_primitive =
+    n =|= 1
+    && match str.[0] with
+       | 'V' | 'Z' | 'B' | 'S' | 'C' | 'I' | 'J' | 'F' | 'D' -> true
+       | _ -> false
+  in
+  let is_descriptor =
+    (n > 2 && starts_with 'L' && ends_with ';') || starts_with '[' || is_primitive
+  in
+  if is_descriptor then str
+  else "L" ^ String.map (function '.' -> '/' | c -> c) str ^ ";"
+
 let wrap_type_expr lang str =
   match lang with
   (* `x` is a placeholder and won't be used during unwrapping. *)
   | Lang.Java -> Some (spf "(%s x)" str)
+  (* A field declaration is the shortest smali construct that carries a type
+     and nothing else. *)
+  | Lang.Smali ->
+      Some (spf ".field public __semgrep_mvt:%s" (smali_descriptor_of str))
   | Lang.Python -> Some (spf "x: %s" str)
   | Lang.Go -> Some (spf "var x %s" str)
   | Lang.Kotlin -> Some (spf "x as %s" str)
@@ -37,6 +63,11 @@ let wrap_type_expr lang str =
 let unwrap_type_expr lang expr =
   match (lang, expr) with
   | Lang.Java, G.E { e = G.TypedMetavar (_, _, t); _ } -> Some t
+  | Lang.Smali, G.S { s = G.DefStmt (_, VarDef { vtype = Some t; _ }); _ } ->
+      Some t
+  | Lang.Smali, G.Ss [ { s = G.DefStmt (_, VarDef { vtype = Some t; _ }); _ } ]
+    ->
+      Some t
   | Lang.Python, G.S { s = G.DefStmt (_, VarDef { vtype = Some t; _ }); _ } ->
       Some t
   | Lang.Go, G.S { s = G.DefStmt (_, VarDef { vtype = Some t; _ }); _ } ->
