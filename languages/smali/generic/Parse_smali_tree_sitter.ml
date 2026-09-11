@@ -447,6 +447,23 @@ let family (op : string) : string =
 let is_invoke op = String.length op >= 6 && String.sub op 0 6 = "invoke"
 let is_const op = String.length op >= 5 && String.sub op 0 5 = "const"
 
+(* A field or array opcode carries the operand type as a suffix --
+   `iget-object`, `sput-boolean`, `aget-wide` -- which says nothing about the
+   access itself. [family] only strips a `/`-suffix, so testing it for
+   equality against "iget" matched the untyped integer form and nothing else:
+   every `-object` access, which is almost all of them, fell through to
+   OtherExpr and was invisible to dataflow. *)
+let has_prefix (op : string) (p : string) : bool =
+  String.length op >= String.length p
+  && String.equal (String.sub op 0 (String.length p)) p
+
+let is_iget op = has_prefix (family op) "iget"
+let is_iput op = has_prefix (family op) "iput"
+let is_sget op = has_prefix (family op) "sget"
+let is_sput op = has_prefix (family op) "sput"
+let is_aget op = has_prefix (family op) "aget"
+let is_aput op = has_prefix (family op) "aput"
+
 let is_move_result op =
   String.length op >= 11 && String.sub op 0 11 = "move-result"
 
@@ -464,6 +481,24 @@ let is_reference_descriptor (t : string) : bool =
   (* a single descriptor letter is a primitive; anything else is a class,
      an array, or a normalised dotted class name *)
   String.length t <> 1 || not (String.contains "VZBSCIJFD" t.[0])
+
+(* `recv.field` for an `iget`/`iput`.
+ *
+ * The field reference the grammar hands over is `Cls.field`, and putting that
+ * whole expression in the offset -- as `FDynamic` -- is what AST_to_IL turns
+ * into an `Index` whose key is a computed expression. Two occurrences then
+ * produce two unrelated temporaries, so a store and a load of the same field
+ * do not meet and a value that goes out to a field and comes back loses its
+ * taint. Naming the field gives a `Dot` offset instead, which is a stable key
+ * and is what Java produces for `this.f`.
+ *
+ * The declaring class drops out of the node, as it does for an instance
+ * invoke, and is recovered the same way: from the pattern text, as a
+ * prefilter condition. *)
+let instance_field (recv : G.expr) (tok : Tok.t) (fld : G.expr) : G.expr =
+  match fld.G.e with
+  | G.DotAccess (_cls, _, (G.FN _ as fn)) -> G.DotAccess (recv, tok, fn) |> G.e
+  | _ -> G.DotAccess (recv, tok, G.FDynamic fld) |> G.e
 
 (* An instruction lowers to one expression. `invoke-*` becomes a Call whose
  * callee is the referenced method; for the instance forms the first operand
@@ -591,12 +626,33 @@ let expression (env : env) ((op, args, _nl) : CST.expression) : G.expr =
   | [ dst; src ] when family opstr = "move" || family opstr = "move-object"
                       || family opstr = "move-wide" ->
       G.Assign (dst, optok, src) |> G.e
-  | [ dst; fld ] when family opstr = "sget" || family opstr = "iget" ->
+  | [ dst; fld ] when is_sget opstr || is_iget opstr ->
       G.Assign (dst, optok, fld) |> G.e
-  | [ src; fld ] when family opstr = "sput" || family opstr = "iput" ->
+  | [ src; fld ] when is_sput opstr || is_iput opstr ->
       G.Assign (fld, optok, src) |> G.e
-  | [ dst; recv; fld ] when family opstr = "iget" ->
-      G.Assign (dst, optok, G.DotAccess (recv, optok, G.FDynamic fld) |> G.e) |> G.e
+  | [ dst; recv; fld ] when is_iget opstr ->
+      G.Assign (dst, optok, instance_field recv optok fld) |> G.e
+  (* The store has to be the mirror image of the load above, or nothing
+     connects the two and a value that goes out to a field and comes back
+     loses its taint. `iput` always carries three operands -- value, object,
+     field -- so the two-operand arm above never sees one; without this arm it
+     fell through to OtherExpr and the store was invisible.
+
+     This is what breaks taint across a Kotlin suspension point: the compiler
+     spills every value that is live across the suspension into an `L$n` field
+     of the continuation and reloads it in a later switch case. It is not
+     specific to coroutines, though -- it was every field store in every
+     language. *)
+  | [ src; recv; fld ] when is_iput opstr ->
+      G.Assign (instance_field recv optok fld, optok, src) |> G.e
+  (* `aget-object v0, v1, v2` is `v0 = v1[v2]`, and `aput-object` the reverse.
+     These had no arm at all, so an array element was opaque -- which matters
+     because key material, IVs and digests are all byte arrays filled element
+     by element. *)
+  | [ dst; arr; idx ] when is_aget opstr ->
+      G.Assign (dst, optok, G.ArrayAccess (arr, fb idx) |> G.e) |> G.e
+  | [ src; arr; idx ] when is_aput opstr ->
+      G.Assign (G.ArrayAccess (arr, fb idx) |> G.e, optok, src) |> G.e
   | [ dst; ty ] when opstr = "new-instance" ->
       let tyname =
         match ty.G.e with
