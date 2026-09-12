@@ -201,6 +201,19 @@ let error_of_rule_error (err : Rule_error.t) : t =
    reporting.
    - TODO: naming exns?
 *)
+(* memprof-limits raises a *private* exception when an interrupt token fires,
+ * so it cannot be matched by name and Printexc is the only handle on it.
+ *
+ * The only thing that sets a token in this codebase is Time_limit's watchdog
+ * thread, so an escaped interrupt is a timeout -- in practice one that fired
+ * in the middle of a parse rather than inside the rule-matching that
+ * Time_limit.set_timeout wraps. Before this was recognised it fell through to
+ * the generic branch and was reported as OtherParseError, which is wrong in
+ * two ways: the file is valid, and a reader sees "malformed input" where the
+ * truth is "this target was never analysed". *)
+let is_interrupt (exn : exn) : bool =
+  String_.contains ~term:"Memprof_limits" (Printexc.to_string exn)
+
 let known_exn_to_error ?(file : Fpath.t option) (e : Exception.t) : t option =
   match Exception.get_exn e with
   (* TODO: Move the cases handling Parsing_error.XXX to the Parsing_error
@@ -241,6 +254,12 @@ let known_exn_to_error ?(file : Fpath.t option) (e : Exception.t) : t option =
       let loc = Some (Tok.first_loc_of_file file) in
       (* TODO: see the comment below we want OtherErrorWithAttachedFile *)
       Some (mk_error ~msg:s ?loc Out.OtherParseError)
+  | exn when is_interrupt exn ->
+      let loc =
+        let* file = file in
+        Some (Tok.first_loc_of_file file)
+      in
+      Some (mk_error ~msg:"interrupted by the time limit" ?loc Out.Timeout)
   (* general case, can't extract line information from it, default to line 1 *)
   | _exn -> None
 
