@@ -293,7 +293,9 @@ let literal (env : env) (x : CST.literal) : G.expr =
       match b with
       | `True t -> G.L (G.Bool (true, token env t)) |> G.e
       | `False t -> G.L (G.Bool (false, token env t)) |> G.e)
-  | `Char (l, _, _r) -> G.L (G.Char (("", token env l))) |> G.e
+  (* One token since the literal was collapsed to stop `#` inside it
+   * being lexed as a comment. The value stays unread, as before. *)
+  | `Char t -> G.L (G.Char (("", token env t))) |> G.e
   | `Null t -> G.L (G.Null (token env t)) |> G.e
 
 (* The text of an access-modifier keyword. Needed before [access_modifier]
